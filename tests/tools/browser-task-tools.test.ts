@@ -237,6 +237,92 @@ test('browser_get_task_history rejects invalid task ids safely', async () => {
   }
 });
 
+test('browser_run_task rejects malformed success payloads without a recognized terminal status', async () => {
+  const { broker } = await createBroker();
+  const socket = await connectBridge(broker, async (frame, ws) => {
+    if (frame.type !== 'browser_run_task') return;
+    // "ok: true, data: {}" with no status field should NOT be recorded as completed.
+    ws.send(JSON.stringify({
+      v: 1,
+      kind: 'response',
+      id: frame.id,
+      ok: true,
+      data: {},
+    }));
+  });
+  const tools = createToolHarness(broker);
+
+  try {
+    const result = await tools.get('browser_run_task').execute('call-1', { task: 'Malformed payload' });
+    assert.equal(result.details.ok, false);
+    assert.equal(result.details.status, 'error');
+    assert.equal(result.details.error.code, 'E_PROTOCOL');
+
+    const history = await tools.get('browser_get_task_history').execute('call-2', { taskId: result.details.taskId });
+    assert.equal(history.details.summary.status, 'error');
+    assert.equal(history.details.summary.error.code, 'E_PROTOCOL');
+  } finally {
+    socket.close();
+    await broker.stop();
+  }
+});
+
+test('browser_get_task_history reports corrupted history distinctly from "not found"', async () => {
+  const { broker, taskStore } = await createBroker();
+  const tools = createToolHarness(broker);
+
+  try {
+    // Write a valid line followed by a malformed line.
+    await taskStore.append('corrupt-task-id', {
+      kind: 'task_started', taskId: 'corrupt-task-id', task: 'Corrupt me', status: 'running', startedAt: Date.now(),
+    });
+    // Now append raw garbage that can't be JSON-parsed.
+    const { writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    await writeFile(join(taskStore.dir, 'corrupt-task-id.jsonl'), '\n{this is not json}\n', { encoding: 'utf8', flag: 'a' });
+
+    const result = await tools.get('browser_get_task_history').execute('call-1', { taskId: 'corrupt-task-id' });
+    assert.equal(result.details.ok, false);
+    assert.equal((result.details as any).corrupted, true);
+    assert.equal((result.details.error as any).code, 'E_HISTORY_CORRUPTED');
+    assert.match(textOf(result), /corrupted/i);
+
+    // And a separate not-found check still reports E_NOT_FOUND.
+    const notFound = await tools.get('browser_get_task_history').execute('call-2', { taskId: 'missing' });
+    assert.equal(notFound.details.ok, false);
+    assert.equal((notFound.details.error as any).code, 'E_NOT_FOUND');
+  } finally {
+    await broker.stop();
+  }
+});
+
+test('browser_list_tasks isolates a corrupted task file instead of failing the whole list', async () => {
+  const { broker, taskStore } = await createBroker();
+  const tools = createToolHarness(broker);
+
+  try {
+    await taskStore.append('good-task-id', {
+      kind: 'task_started', taskId: 'good-task-id', task: 'Good one', status: 'running', startedAt: Date.now(),
+    });
+    const { writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    await writeFile(join(taskStore.dir, 'bad-task-id.jsonl'), 'not json at all\n', 'utf8');
+
+    const result = await tools.get('browser_list_tasks').execute('call-1', { limit: 20 });
+    assert.equal(result.details.ok, true);
+    const tasks = result.details.tasks as any[];
+    const bad = tasks.find((t) => t.taskId === 'bad-task-id');
+    const good = tasks.find((t) => t.taskId === 'good-task-id');
+    assert.ok(bad);
+    assert.equal(bad.corrupted, true);
+    assert.equal(bad.status, 'corrupted');
+    assert.ok(good);
+    assert.equal(good.task, 'Good one');
+  } finally {
+    await broker.stop();
+  }
+});
+
 test('browser_run_task surfaces bridge disconnect as a structured error result', async () => {
   const { broker } = await createBroker();
   const socket = await connectBridge(broker, async (frame, ws) => {

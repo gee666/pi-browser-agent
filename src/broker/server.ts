@@ -80,14 +80,21 @@ export class BrowserAgentBroker {
       await this.taskStore.gc();
       await new Promise<void>((resolve, reject) => {
         const server = new WebSocketServer({ host: this.host, port: this.port });
-        this.server = server;
 
         const onError = (error: Error) => {
           server.off('listening', onListening);
+          // Startup failed; do not publish the server as the broker's listener.
+          this.server = null;
+          try {
+            server.close();
+          } catch {
+            // ignore; server never finished binding
+          }
           reject(error);
         };
         const onListening = () => {
           server.off('error', onError);
+          this.server = server;
           resolve();
         };
 
@@ -128,6 +135,7 @@ export class BrowserAgentBroker {
     } catch (error) {
       this.startupError = error instanceof Error ? error : new Error(String(error));
       this.logger.error?.('[pi-browser-agent] broker startup failed', this.startupError);
+      throw this.startupError;
     }
   }
 
@@ -178,7 +186,8 @@ export class BrowserAgentBroker {
   }
 
   async request(type: string, params: unknown, options: { timeoutMs?: number } = {}): Promise<ResponseFrame> {
-    if (!this.bridgeSocket || !this.bridgeHello) {
+    const socket = this.bridgeSocket;
+    if (!socket || !this.bridgeHello) {
       throw new Error('E_BRIDGE_DISCONNECTED');
     }
 
@@ -194,8 +203,17 @@ export class BrowserAgentBroker {
 
       this.pendingRequests.set(id, { resolve, reject, timeout });
 
+      // If the bridge went away between our validation and send, reject fast
+      // so callers get a direct disconnect error instead of waiting for a timeout.
+      if (this.bridgeSocket !== socket) {
+        clearTimeout(timeout);
+        this.pendingRequests.delete(id);
+        reject(new Error('E_BRIDGE_DISCONNECTED'));
+        return;
+      }
+
       try {
-        this.bridgeSocket?.send(payload);
+        socket.send(payload);
       } catch (error) {
         clearTimeout(timeout);
         this.pendingRequests.delete(id);
@@ -221,14 +239,9 @@ export class BrowserAgentBroker {
     const bridgeSocket = socket as BridgeSocket;
     bridgeSocket.isAlive = true;
 
-    if (this.bridgeSocket && this.bridgeSocket !== socket) {
-      this.failBridge(this.bridgeSocket as BridgeSocket, new Error('E_BRIDGE_DISCONNECTED'));
-      try {
-        this.bridgeSocket.close(1012, 'Superseded by a newer bridge connection');
-      } catch (error) {
-        this.logger.warn?.('[pi-browser-agent] failed to close stale bridge socket', error);
-      }
-    }
+    // Do NOT evict the current bridge here. A new accepted socket has not yet
+    // authenticated as a bridge session. We only replace the active bridge
+    // once this socket sends a valid `hello` frame (see handleRawMessage).
 
     bridgeSocket.on('pong', () => {
       bridgeSocket.isAlive = true;
@@ -273,10 +286,24 @@ export class BrowserAgentBroker {
     const frame = parseIncomingFrame(raw);
 
     if (frame.kind === 'hello') {
+      // Promote this socket to the active bridge. Capture the previous one in
+      // a local so we can close it explicitly after state has been swapped.
+      const previous = this.bridgeSocket as BridgeSocket | null;
+      const isHandoff = previous !== null && previous !== socket;
+
       this.bridgeSocket = socket;
       this.bridgeHello = frame;
       this.bridgeSessionSerial += 1;
       socket.send(JSON.stringify(createWelcomeFrame('0.0.0')));
+
+      if (isHandoff && previous) {
+        this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
+        try {
+          previous.close(1012, 'Superseded by a newer bridge connection');
+        } catch (error) {
+          this.logger.warn?.('[pi-browser-agent] failed to close stale bridge socket', error);
+        }
+      }
       return;
     }
 

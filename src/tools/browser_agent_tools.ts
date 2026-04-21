@@ -1,16 +1,12 @@
 import { Type } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
-import { getPlaceholderBrowserToolSpecs, registerAllTools } from './_register.ts';
-
-let browserToolsRegistered = false;
+import { getPlaceholderBrowserToolSpecs } from './_register.ts';
 
 export function resetBrowserAgentToolState(): void {
-  browserToolsRegistered = false;
-}
-
-export function setBrowserAgentToolState(value: boolean): void {
-  browserToolsRegistered = value;
+  // No-op retained for API compatibility. Browser tool registration is now
+  // performed eagerly at session_start in src/index.ts, so the meta-tool no
+  // longer owns any first-call registration state.
 }
 
 function buildFailureMessage(reason: string, probe: ReturnType<BrowserAgentBroker['probeConnectivity']>): string {
@@ -25,11 +21,9 @@ function buildFailureMessage(reason: string, probe: ReturnType<BrowserAgentBroke
   ].join('\n');
 }
 
-function buildSuccessMessage(newlyRegistered: string[], probe: ReturnType<BrowserAgentBroker['probeConnectivity']>): string {
+function buildSuccessMessage(probe: ReturnType<BrowserAgentBroker['probeConnectivity']>): string {
   const lines = [
-    browserToolsRegistered && newlyRegistered.length === 0
-      ? 'Browser agent is available. Browser tools were already registered for this session.'
-      : 'Browser agent is available and browser tools are now registered.',
+    'Browser agent is available. Browser tools are registered for this session.',
     'These are direct pi tools, not MCP tool, invoke them directly in this session.',
     '',
     'Available browser_* tools:',
@@ -43,17 +37,15 @@ function buildSuccessMessage(newlyRegistered: string[], probe: ReturnType<Browse
   return lines.join('\n');
 }
 
-export function createBrowserAgentToolsTool(pi: { registerTool: (tool: any) => void }, broker: BrowserAgentBroker) {
+export function createBrowserAgentToolsTool(_pi: { registerTool: (tool: any) => void }, broker: BrowserAgentBroker) {
   return {
     name: 'activate_browser_agent_tools',
     label: 'Activate Browser Agent Tools',
     description:
-      'A browser integration is available for this session. Call this tool to activate it and register the browser tools dynamically.',
-    promptSnippet: 'Activate the browser integration for this session.',
-    parameters: Type.Object({
-      force_refresh: Type.Optional(Type.Boolean({ default: false })),
-    }),
-    async execute(_toolCallId: string, params: { force_refresh?: boolean }) {
+      'Self-check for the browser integration. The browser_* tool suite is registered at session start; this tool reports current broker/bridge status.',
+    promptSnippet: 'Check the browser integration status for this session.',
+    parameters: Type.Object({}),
+    async execute(_toolCallId: string, _params: Record<string, unknown>) {
       const probe = broker.probeConnectivity();
       if (!probe.brokerReachable || !probe.brokerListening) {
         return {
@@ -69,12 +61,10 @@ export function createBrowserAgentToolsTool(pi: { registerTool: (tool: any) => v
         };
       }
 
-      const shouldRegister = !browserToolsRegistered || params.force_refresh;
-      const newlyRegistered = shouldRegister ? registerAllTools(pi, { broker }) : [];
-      browserToolsRegistered = true;
-
+      // Idempotent status report. Browser tools are registered at session_start
+      // in src/index.ts; this tool no longer performs any registration.
       return {
-        content: [{ type: 'text', text: buildSuccessMessage(newlyRegistered, probe) }],
+        content: [{ type: 'text', text: buildSuccessMessage(probe) }],
         details: { probe, registeredTools: getPlaceholderBrowserToolSpecs().map((tool) => tool.name) },
       };
     },

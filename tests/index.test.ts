@@ -34,7 +34,7 @@ function createPiHarness() {
   };
 }
 
-test('extension eagerly registers browser tools on session start when the bridge is connected, and restarts broker after shutdown', async () => {
+test('extension eagerly registers the full browser_* suite at session start when the broker is listening, and restarts broker after shutdown', async () => {
   await resetForTests();
   const originalPort = process.env.PI_BA_PORT;
 
@@ -51,6 +51,9 @@ test('extension eagerly registers browser tools on session start when the bridge
 
     await sessionStart({}, {});
     assert.equal(pi.tools.has('activate_browser_agent_tools'), true);
+    // pi reads the tool registry at session_start, so the full browser_*
+    // suite is registered eagerly whenever the broker is listening. Tools
+    // themselves probe the bridge at call time.
     assert.equal(pi.tools.has('browser_run_task'), true);
     const firstBroker = getBroker();
     assert.ok(firstBroker);
@@ -97,7 +100,10 @@ test('extension retries broker startup on a later session after a transient bind
     const sessionShutdown = pi.handlers.get('session_shutdown');
 
     await sessionStart({}, {});
-    assert.equal(getBroker()?.probeConnectivity().brokerListening, false);
+    // Startup failed; no broker is published as the singleton.
+    assert.equal(getBroker(), null);
+    // Meta-tool should still be registered so the session has a diagnostic surface.
+    assert.equal(pi.tools.has('activate_browser_agent_tools'), true);
 
     await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
     pi.tools.clear();
@@ -106,6 +112,35 @@ test('extension retries broker startup on a later session after a transient bind
 
     assert.equal(pi.tools.has('activate_browser_agent_tools'), true);
     assert.equal(getBroker()?.probeConnectivity().brokerListening, true);
+    await sessionShutdown({}, {});
+  } finally {
+    await resetForTests();
+    if (originalPort === undefined) {
+      delete process.env.PI_BA_PORT;
+    } else {
+      process.env.PI_BA_PORT = originalPort;
+    }
+  }
+});
+
+test('overlapping session_start calls yield a single shared broker instance', async () => {
+  await resetForTests();
+  const originalPort = process.env.PI_BA_PORT;
+  try {
+    process.env.PI_BA_PORT = String(await getFreePort());
+    const pi = createPiHarness();
+    await extension(pi as any);
+    const sessionStart = pi.handlers.get('session_start');
+    const sessionShutdown = pi.handlers.get('session_shutdown');
+
+    // Fire two concurrent session_start handlers before either returns.
+    await Promise.all([sessionStart({}, {}), sessionStart({}, {})]);
+
+    const broker = getBroker();
+    assert.ok(broker);
+    assert.equal(broker?.probeConnectivity().brokerListening, true);
+    assert.equal(pi.tools.has('activate_browser_agent_tools'), true);
+
     await sessionShutdown({}, {});
   } finally {
     await resetForTests();

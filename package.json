@@ -4,6 +4,10 @@
   "private": false,
   "type": "module",
   "description": "Pi browser agent broker skeleton with lazy browser tool registration",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gee666/pi-browser-agent.git"
+  },
   "pi": {
     "extensions": [
       "./src/index.ts"

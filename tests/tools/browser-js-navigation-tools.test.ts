@@ -120,7 +120,31 @@ test('navigation/destructive tool builders pass through successful bridge respon
 
   const clear = await createBrowserClearSiteDataTool(broker).execute('call-7', { origin: 'https://example.com' });
   assert.match(textOf(clear), /Cleared site data/);
+  // Explicit origin/url must NOT be combined with use_active_tab: that would
+  // send conflicting selectors to the bridge.
+  assert.equal(calls.at(-1)?.params?.use_active_tab, undefined);
+  assert.equal(calls.at(-1)?.params?.origin, 'https://example.com');
+});
+
+test('browser_clear_site_data defaults to the active tab only when no explicit target is given', async () => {
+  const calls: Array<{ type: string; params: any }> = [];
+  const broker = createBrokerStub(async (type, params) => {
+    calls.push({ type, params });
+    return {
+      v: 1,
+      kind: 'response',
+      id: type,
+      ok: true,
+      data: { origin: 'https://example.com', cleared: true },
+    };
+  });
+
+  await createBrowserClearSiteDataTool(broker).execute('call-c1', {});
   assert.equal(calls.at(-1)?.params?.use_active_tab, true);
+
+  await createBrowserClearSiteDataTool(broker).execute('call-c2', { url: 'https://example.com/path' });
+  assert.equal(calls.at(-1)?.params?.use_active_tab, undefined);
+  assert.equal(calls.at(-1)?.params?.url, 'https://example.com/path');
 });
 
 test('browser_reload_extension waits for a new bridge session after requesting reload', async () => {
@@ -147,6 +171,44 @@ test('browser_reload_extension waits for a new bridge session after requesting r
   const result = await createBrowserReloadExtensionTool(broker).execute('call-ext', { timeout_ms: 1_000 });
   assert.equal(result.details.ok, true);
   assert.match(textOf(result), /Reloaded browser extension abc123/);
+});
+
+test('navigation tools reject malformed success payloads without required fields', async () => {
+  // Navigate response missing tabId should be surfaced as E_PROTOCOL.
+  const navBroker = createBrokerStub(async () => ({
+    v: 1, kind: 'response', id: 'n', ok: true, data: { url: 'https://example.com' },
+  }));
+  const navResult = await createBrowserNavigateTool(navBroker).execute('call-n', { url: 'https://example.com' });
+  assert.equal(navResult.details.ok, false);
+  assert.equal((navResult.details as any).error.code, 'E_PROTOCOL');
+  assert.match(textOf(navResult), /browser_navigate failed/);
+
+  // clear_site_data without origin in response should be E_PROTOCOL too.
+  const clearBroker = createBrokerStub(async () => ({
+    v: 1, kind: 'response', id: 'c', ok: true, data: { cleared: true },
+  }));
+  const clearResult = await createBrowserClearSiteDataTool(clearBroker).execute('call-c', { origin: 'https://example.com' });
+  assert.equal(clearResult.details.ok, false);
+  assert.equal((clearResult.details as any).error.code, 'E_PROTOCOL');
+});
+
+test('browser_reload_extension surfaces reconnect timeout as a structured error result', async () => {
+  const broker = {
+    async request() {
+      return {
+        v: 1, kind: 'response', id: 'ext', ok: true, data: { extensionId: 'abc', reloading: true },
+      } as ResponseFrame;
+    },
+    // Always report the same bridge session serial — the tool should time out waiting for a new one.
+    probeConnectivity() {
+      return { brokerReachable: true, brokerListening: true, bridgeConnected: true, bridgeSessionSerial: 42, url: 'ws://127.0.0.1:7878' };
+    },
+  } as any;
+
+  const result = await createBrowserReloadExtensionTool(broker).execute('call-ext-t', { timeout_ms: 150 });
+  assert.equal(result.details.ok, false);
+  assert.equal((result.details as any).error.code, 'E_TIMEOUT');
+  assert.match(textOf(result), /browser_reload_extension failed/);
 });
 
 test('tool builders convert transport exceptions into safe error payloads', async () => {

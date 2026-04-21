@@ -2,6 +2,7 @@ import { Type } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import {
+  coerceError,
   defaultTimeoutMs,
   formatJsonResult,
   requestBridge,
@@ -63,23 +64,31 @@ export function createBrowserGetConsoleLogsTool(broker: BrowserAgentBroker) {
     }),
     async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResult> {
       const requestParams = withDefaultActiveTabTarget(params);
-      const { data } = await requestBridge<Record<string, unknown>>(broker, 'browser_get_console_logs', requestParams, {
-        timeoutMs: Number(requestParams.timeout_ms || defaultTimeoutMs('browser_get_console_logs')),
-      });
+      try {
+        const { data } = await requestBridge<Record<string, unknown>>(broker, 'browser_get_console_logs', requestParams, {
+          timeoutMs: Number(requestParams.timeout_ms || defaultTimeoutMs('browser_get_console_logs')),
+        });
 
-      const rendered = await formatJsonResult('Browser console logs', data, 'json');
-      const details = {
-        ok: true,
-        tabId: data.tabId,
-        total: data.total,
-        returned: data.returned,
-        disconnectedAt: data.disconnectedAt,
-        disconnectReason: data.disconnectReason,
-        truncation: rendered.truncated,
-        fullOutputPath: rendered.fullOutputPath,
-        preview: rendered.text,
-      };
-      return textResult(consoleLogText(details), details);
+        const rendered = await formatJsonResult('Browser console logs', data, 'json');
+        const details = {
+          ok: true,
+          tabId: data.tabId,
+          total: data.total,
+          returned: data.returned,
+          disconnectedAt: data.disconnectedAt,
+          disconnectReason: data.disconnectReason,
+          truncation: rendered.truncated,
+          fullOutputPath: rendered.fullOutputPath,
+          preview: rendered.text,
+        };
+        return textResult(consoleLogText(details), details);
+      } catch (error) {
+        const info = coerceError(error);
+        return textResult(`browser_get_console_logs failed: ${info.message}`, {
+          ok: false,
+          error: { code: info.code, message: info.message, details: info.details },
+        });
+      }
     },
   };
 }
@@ -121,23 +130,31 @@ export function createBrowserGetNetworkTool(broker: BrowserAgentBroker) {
     }),
     async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResult> {
       const requestParams = withDefaultActiveTabTarget(params);
-      const { data } = await requestBridge<Record<string, unknown>>(broker, 'browser_get_network', requestParams, {
-        timeoutMs: Number(requestParams.timeout_ms || defaultTimeoutMs('browser_get_network')),
-      });
+      try {
+        const { data } = await requestBridge<Record<string, unknown>>(broker, 'browser_get_network', requestParams, {
+          timeoutMs: Number(requestParams.timeout_ms || defaultTimeoutMs('browser_get_network')),
+        });
 
-      const rendered = await formatJsonResult('Browser network activity', data, 'json');
-      const details = {
-        ok: true,
-        tabId: data.tabId,
-        total: data.total,
-        returned: data.returned,
-        disconnectedAt: data.disconnectedAt,
-        disconnectReason: data.disconnectReason,
-        truncation: rendered.truncated,
-        fullOutputPath: rendered.fullOutputPath,
-        preview: rendered.text,
-      };
-      return textResult(networkText(details), details);
+        const rendered = await formatJsonResult('Browser network activity', data, 'json');
+        const details = {
+          ok: true,
+          tabId: data.tabId,
+          total: data.total,
+          returned: data.returned,
+          disconnectedAt: data.disconnectedAt,
+          disconnectReason: data.disconnectReason,
+          truncation: rendered.truncated,
+          fullOutputPath: rendered.fullOutputPath,
+          preview: rendered.text,
+        };
+        return textResult(networkText(details), details);
+      } catch (error) {
+        const info = coerceError(error);
+        return textResult(`browser_get_network failed: ${info.message}`, {
+          ok: false,
+          error: { code: info.code, message: info.message, details: info.details },
+        });
+      }
     },
   };
 }

@@ -150,6 +150,21 @@ test('plain broker timeout errors are surfaced as E_TIMEOUT instead of bridge di
 });
 
 
+test('browser_get_html rejects malformed success payloads without html/content', async () => {
+  const tools = createReadOnlyBrowserToolMap(createBrokerHarness(async () => ({
+    ok: true,
+    id: 'req-h',
+    kind: 'response',
+    v: 1,
+    data: { url: 'https://example.com' },
+  })));
+
+  const result = await tools.get('browser_get_html')!.execute('call-1', {});
+  assert.equal(result.details.ok, false);
+  assert.equal((result.details.error as any).code, 'E_PROTOCOL');
+  assert.match(textOf(result), /did not include html/i);
+});
+
 test('browser_get_screenshot rejects malformed success payloads without image data', async () => {
   const tools = createReadOnlyBrowserToolMap(createBrokerHarness(async () => ({
     ok: true,

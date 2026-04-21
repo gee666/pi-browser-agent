@@ -4,22 +4,26 @@ import { Type } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import type { ResponseFrame } from '../broker/protocol.ts';
-import { assertValidTaskId, type TaskStoreEntry } from '../broker/task-store.ts';
+import { assertValidTaskId, TaskCorruptionError, type TaskStoreEntry } from '../broker/task-store.ts';
 
 interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
   details: Record<string, unknown>;
 }
 
-function terminalStatusOf(data: any): string {
-  if (typeof data?.status === 'string' && data.status) {
+const TERMINAL_TASK_STATUSES = new Set(['done', 'error', 'stopped', 'rejected']);
+
+function terminalStatusOf(data: any): string | null {
+  if (typeof data?.status === 'string' && TERMINAL_TASK_STATUSES.has(data.status)) {
     return data.status;
   }
-  return data?.cancelled ? 'stopped' : 'done';
+  if (data?.cancelled === true) {
+    return 'stopped';
+  }
+  return null;
 }
 
-function runtimeErrorFromData(data: any): { code: string; message: string; details?: unknown } | null {
-  const status = terminalStatusOf(data);
+function runtimeErrorFromData(data: any, status: string): { code: string; message: string; details?: unknown } | null {
   if (status !== 'error') {
     return null;
   }
@@ -87,6 +91,29 @@ async function safeReadHistory(broker: BrowserAgentBroker, taskId: string): Prom
     return await broker.taskStore.read(taskId);
   } catch {
     return [];
+  }
+}
+
+async function readHistoryStrict(
+  broker: BrowserAgentBroker,
+  taskId: string,
+): Promise<{ ok: true; history: TaskStoreEntry[] } | { ok: false; corrupted: boolean; error: { code: string; message: string } }> {
+  try {
+    return { ok: true, history: await broker.taskStore.read(taskId) };
+  } catch (error) {
+    if (error instanceof TaskCorruptionError) {
+      return {
+        ok: false,
+        corrupted: true,
+        error: { code: 'E_HISTORY_CORRUPTED', message: error.message },
+      };
+    }
+    // Any other error (e.g. ENOENT) means there's no readable history.
+    return {
+      ok: false,
+      corrupted: false,
+      error: { code: 'E_NOT_FOUND', message: `Task ${taskId} was not found` },
+    };
   }
 }
 
@@ -236,8 +263,29 @@ export function createBrowserRunTaskTool(broker: BrowserAgentBroker) {
         });
       }
 
-      const runtimeError = runtimeErrorFromData(response.data);
-      const status = terminalStatusOf(response.data);
+      const resolvedStatus = terminalStatusOf(response.data);
+      if (!resolvedStatus) {
+        const errorInfo = {
+          code: 'E_PROTOCOL',
+          message: 'Bridge returned a success response for browser_run_task without a recognized terminal status',
+          details: { data: response.data },
+        };
+        const history = await finishRecordedTask(broker, taskId, 'error', { error: errorInfo });
+        return textResult(formatResponseText(taskId, 'error', errorInfo.message), {
+          ok: false,
+          success: false,
+          taskId,
+          status: 'error',
+          error: errorInfo,
+          response,
+          probe,
+          history,
+          summary: summarizeHistory(taskId, history),
+          historySummary: null,
+        });
+      }
+      const status = resolvedStatus;
+      const runtimeError = runtimeErrorFromData(response.data, status);
       const history = await finishRecordedTask(broker, taskId, status, runtimeError ? { error: runtimeError } : { result: response.data });
       const message = typeof (response.data as any)?.message === 'string' ? (response.data as any).message : undefined;
 
@@ -280,7 +328,21 @@ export function createBrowserGetTaskHistoryTool(broker: BrowserAgentBroker) {
         });
       }
 
-      const history = await safeReadHistory(broker, params.taskId);
+      const readResult = await readHistoryStrict(broker, params.taskId);
+      if (!readResult.ok) {
+        // Distinguish corrupted history from "not found" so operators aren't
+        // misled into thinking no data ever existed.
+        const prefix = readResult.corrupted
+          ? `Browser task history for ${params.taskId} is corrupted.`
+          : `No browser task history found for ${params.taskId}.`;
+        return textResult(prefix, {
+          ok: false,
+          taskId: params.taskId,
+          corrupted: readResult.corrupted,
+          error: readResult.error,
+        });
+      }
+      const history = readResult.history;
       if (history.length === 0) {
         return textResult(`No browser task history found for ${params.taskId}.`, {
           ok: false,

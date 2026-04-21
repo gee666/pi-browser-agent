@@ -73,6 +73,24 @@ function withDefaultActiveTabTarget(params: Record<string, unknown>) {
   };
 }
 
+// browser_clear_site_data accepts explicit origin/url targets. If either is
+// supplied, do not inject use_active_tab — that would send conflicting
+// selectors to the bridge and risk clearing the wrong site's data.
+function withClearSiteDataTarget(params: Record<string, unknown>) {
+  if (
+    typeof params.tab_id === 'number'
+    || params.use_active_tab === true
+    || typeof params.origin === 'string'
+    || typeof params.url === 'string'
+  ) {
+    return params;
+  }
+  return {
+    ...params,
+    use_active_tab: true,
+  };
+}
+
 function createSuccessText(name: string, data: any, spill?: { text: string; truncated: boolean; fullOutputPath?: string }) {
   const headline =
     name === 'browser_navigate'
@@ -96,6 +114,36 @@ function createSuccessText(name: string, data: any, spill?: { text: string; trun
   }
 
   return `${headline}\n\n${spill.text}`;
+}
+
+// Minimal response shape validation: reject success payloads that drop fields
+// the downstream success text depends on. This catches bridge regressions
+// before they masquerade as completed operations.
+function validateSuccessPayload(name: string, data: any): { code: string; message: string; details?: unknown } | null {
+  if (!data || typeof data !== 'object') {
+    return { code: 'E_PROTOCOL', message: `${name} response payload was missing`, details: { data } };
+  }
+  const needsTabId = new Set([
+    'browser_navigate',
+    'browser_switch_tab',
+    'browser_close_tab',
+    'browser_reload',
+    'browser_evaluate_js',
+    'browser_run_js',
+  ]);
+  if (needsTabId.has(name) && typeof (data as any).tabId !== 'number') {
+    return { code: 'E_PROTOCOL', message: `${name} response did not include tabId`, details: { data } };
+  }
+  if (name === 'browser_navigate' && typeof (data as any).url !== 'string' && typeof (data as any).requestedUrl !== 'string') {
+    return { code: 'E_PROTOCOL', message: 'browser_navigate response did not include url', details: { data } };
+  }
+  if (name === 'browser_clear_site_data' && typeof (data as any).origin !== 'string') {
+    return { code: 'E_PROTOCOL', message: 'browser_clear_site_data response did not include origin', details: { data } };
+  }
+  if (name === 'browser_reload_extension' && typeof (data as any).extensionId !== 'string') {
+    return { code: 'E_PROTOCOL', message: 'browser_reload_extension response did not include extensionId', details: { data } };
+  }
+  return null;
 }
 
 async function waitForBridgeSessionChange(broker: BrowserAgentBroker, beforeProbe: ProbeResult, timeoutMs: number): Promise<ProbeResult> {
@@ -140,15 +188,16 @@ function createRequestTool(options: {
     promptSnippet: options.promptSnippet,
     parameters: options.parameters,
     async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResult> {
-      const requestParams = [
-        'browser_evaluate_js',
-        'browser_run_js',
-        'browser_navigate',
-        'browser_reload',
-        'browser_clear_site_data',
-      ].includes(options.name)
-        ? withDefaultActiveTabTarget(params)
-        : params;
+      const requestParams = options.name === 'browser_clear_site_data'
+        ? withClearSiteDataTarget(params)
+        : [
+          'browser_evaluate_js',
+          'browser_run_js',
+          'browser_navigate',
+          'browser_reload',
+        ].includes(options.name)
+          ? withDefaultActiveTabTarget(params)
+          : params;
 
       const outcome = await brokerToolRequest(broker, options.name, requestParams, options.timeoutFromParams(requestParams));
       if (!outcome.ok) {
@@ -160,6 +209,15 @@ function createRequestTool(options: {
       }
 
       const data = outcome.data as any;
+      const protocolError = validateSuccessPayload(options.name, data);
+      if (protocolError) {
+        return textResult(`${options.name} failed: ${protocolError.message}`, {
+          ok: false,
+          error: protocolError,
+          request: requestParams,
+          result: data,
+        });
+      }
       const spill = await formatPayload(data, 'json');
       return textResult(createSuccessText(options.name, data, spill), {
         ok: true,
@@ -350,6 +408,17 @@ export function createBrowserReloadExtensionTool(broker: BrowserAgentBroker) {
       try {
         const afterProbe = await waitForBridgeSessionChange(broker, beforeProbe, timeoutMs);
         const data = { ...(outcome.data as Record<string, unknown>), reconnected: true };
+        const protocolError = validateSuccessPayload('browser_reload_extension', data);
+        if (protocolError) {
+          return textResult(`browser_reload_extension failed: ${protocolError.message}`, {
+            ok: false,
+            error: protocolError,
+            request: params,
+            result: data,
+            probeBefore: beforeProbe,
+            probeAfter: broker.probeConnectivity(),
+          });
+        }
         const spill = await formatPayload(data, 'json');
         return textResult(createSuccessText('browser_reload_extension', data, spill), {
           ok: true,

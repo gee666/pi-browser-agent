@@ -166,7 +166,14 @@ function createHtmlTool(broker: BrowserAgentBroker): ReadOnlyToolDefinition<any>
         const { data, response } = await requestBridge<any>(broker, 'browser_get_html', params, {
           timeoutMs: defaultTimeoutMs('browser_get_html'),
         });
-        const html = typeof data?.html === 'string' ? data.html : typeof data?.content === 'string' ? data.content : '';
+        if (typeof data?.html !== 'string' && typeof data?.content !== 'string') {
+          throw new BrowserReadOnlyToolError(
+            'E_PROTOCOL',
+            'browser_get_html response did not include html/content payload',
+            { data },
+          );
+        }
+        const html = typeof data?.html === 'string' ? data.html : (data.content as string);
         const formatted = await formatTextResult(`HTML for ${data?.url || params.url || 'current page'}`, html, 'html');
         return textResult(formatted.text, {
           ok: true,

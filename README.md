@@ -1,12 +1,12 @@
 # pi-browser-agent
 
-`pi-browser-agent` is a pi extension that starts a local WebSocket broker and lazily registers a browser-driving tool suite for `browser-agent-ext`.
+`pi-browser-agent` is a pi extension that starts a local WebSocket broker and registers a browser-driving tool suite for `browser-agent-ext`.
 
 ## What it does
 
 - starts a loopback-only broker on `ws://127.0.0.1:7878` by default
-- exposes one lightweight meta-tool first: `activate_browser_agent_tools`
-- registers the full `browser_*` tool suite only after the Chrome bridge is reachable
+- registers the full `browser_*` tool suite at session start when the broker starts listening
+- exposes `activate_browser_agent_tools` as a self-check / status tool
 - forwards tool calls to `browser-agent-ext`
 - keeps browser-task history on disk for local inspection
 
@@ -41,13 +41,13 @@ For the current in-repo state, use the local-checkout form above.
 
 ## First use in a pi session
 
-Call:
+All `browser_*` tools are registered at session start when the broker starts listening. `activate_browser_agent_tools` remains available as a self-check / status tool:
 
 ```text
 activate_browser_agent_tools
 ```
 
-That meta-tool checks connectivity and then registers the full toolkit for the session:
+The full toolkit registered for the session is:
 
 - `browser_run_task`
 - `browser_get_task_history`

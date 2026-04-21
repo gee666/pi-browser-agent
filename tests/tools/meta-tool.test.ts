@@ -20,7 +20,7 @@ function textOf(result: any): string {
   return result.content[0].text;
 }
 
-test('meta-tool does not register browser tools when broker is offline', async () => {
+test('meta-tool reports broker-offline status accurately and does not register any tools itself', async () => {
   resetBrowserAgentToolState();
   resetRegisteredBrowserTools();
   const pi = createFakePi();
@@ -40,10 +40,11 @@ test('meta-tool does not register browser tools when broker is offline', async (
   assert.match(textOf(result), /not available/i);
   assert.equal(tool.name, 'activate_browser_agent_tools');
   assert.doesNotMatch(tool.description, /browser_run_task|browser_get_html|browser_get_network/i);
+  // The meta-tool never registers tools; registration happens at session_start.
   assert.equal(pi.tools.size, 0);
 });
 
-test('meta-tool does not register browser tools when broker is online but bridge is absent', async () => {
+test('meta-tool reports bridge-absent status accurately; registration is the session_start handler’s job, not the meta-tool’s', async () => {
   resetBrowserAgentToolState();
   resetRegisteredBrowserTools();
   const pi = createFakePi();
@@ -60,10 +61,13 @@ test('meta-tool does not register browser tools when broker is online but bridge
 
   const result = await tool.execute('call-1', {});
   assert.match(textOf(result), /bridge is not connected/i);
+  // Broker listening alone is now enough for session_start to register the
+  // suite, because tools return structured errors when the bridge is absent.
+  // The meta-tool itself never registers tools.
   assert.equal(pi.tools.size, 0);
 });
 
-test('meta-tool lazily registers placeholder browser tools once and is idempotent', async () => {
+test('meta-tool reports ready status when broker + bridge are healthy and remains idempotent across calls', async () => {
   resetBrowserAgentToolState();
   resetRegisteredBrowserTools();
   const pi = createFakePi();
@@ -83,21 +87,24 @@ test('meta-tool lazily registers placeholder browser tools once and is idempoten
   } as any);
 
   const first = await tool.execute('call-1', {});
-  assert.match(textOf(first), /tools are now registered/i);
+  assert.match(textOf(first), /tools are registered/i);
   assert.match(textOf(first), /Available browser_\* tools:/i);
   assert.match(textOf(first), /direct pi tools, not mcp tool, invoke them directly/i);
-  assert.equal(pi.tools.has('browser_run_task'), true);
-  const countAfterFirst = pi.tools.size;
-  assert.ok(countAfterFirst >= 20);
+  // The meta-tool itself no longer registers tools; that happens at session_start.
+  assert.equal(pi.tools.size, 0);
 
   const second = await tool.execute('call-2', {});
-  assert.match(textOf(second), /already registered/i);
-  assert.equal(pi.tools.size, countAfterFirst);
+  assert.match(textOf(second), /tools are registered/i);
+  assert.equal(pi.tools.size, 0);
 
-  const third = await tool.execute('call-3', { force_refresh: true });
-  assert.match(textOf(third), /already registered/i);
-  assert.equal(pi.tools.size, countAfterFirst);
+  // The meta-tool exposes no refresh parameter: repeated calls remain idempotent.
+  const thirdParamProps = (tool.parameters as any).properties || {};
+  assert.equal('force_refresh' in thirdParamProps, false);
+  const third = await tool.execute('call-3', {});
+  assert.match(textOf(third), /tools are registered/i);
+  assert.equal(pi.tools.size, 0);
   assert.equal(probes, 3);
   assert.ok(Array.isArray(first.details.registeredTools));
   assert.ok(first.details.registeredTools.includes('browser_run_task'));
+  assert.ok(third.details.registeredTools.includes('browser_run_task'));
 });

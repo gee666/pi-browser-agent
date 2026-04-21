@@ -63,21 +63,31 @@ test('browser_get_console_logs defaults to the active tab when no target is prov
   assert.deepEqual(call.params, { last: 5, use_active_tab: true });
 });
 
-test('browser_get_network tool throws structured failures instead of returning soft-error payloads', async () => {
+test('browser_get_network tool returns structured error results on bridge failure', async () => {
   const tool = createBrowserGetNetworkTool(createBroker({
     async request() {
       throw { code: 'E_BRIDGE_DISCONNECTED', message: 'socket dropped' };
     },
   }));
 
-  await assert.rejects(
-    () => tool.execute('call-1', { filter: { failed_only: true } }),
-    (error: any) => {
-      assert.equal(error.code, 'E_BRIDGE_DISCONNECTED');
-      assert.equal(error.message, 'socket dropped');
-      return true;
+  const result = await tool.execute('call-1', { filter: { failed_only: true } });
+  assert.equal(result.details.ok, false);
+  assert.equal((result.details as any).error.code, 'E_BRIDGE_DISCONNECTED');
+  assert.equal((result.details as any).error.message, 'socket dropped');
+  assert.match(textOf(result), /browser_get_network failed: socket dropped/);
+});
+
+test('browser_get_console_logs tool returns structured error results on bridge failure', async () => {
+  const tool = createBrowserGetConsoleLogsTool(createBroker({
+    async request() {
+      throw { code: 'E_BRIDGE_DISCONNECTED', message: 'socket dropped' };
     },
-  );
+  }));
+
+  const result = await tool.execute('call-1', { last: 5 });
+  assert.equal(result.details.ok, false);
+  assert.equal((result.details as any).error.code, 'E_BRIDGE_DISCONNECTED');
+  assert.match(textOf(result), /browser_get_console_logs failed: socket dropped/);
 });
 
 test('buffered observability tool-definition builders expose both tools', () => {
