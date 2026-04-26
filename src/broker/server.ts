@@ -163,7 +163,6 @@ export class BrowserAgentBroker {
         const err = error instanceof Error ? error : new Error(String(error));
         const code = (err as NodeJS.ErrnoException).code;
         if (code === 'EADDRINUSE') {
-          this.logger.warn?.('[pi-browser-agent] port busy, trying next candidate', { tried: candidate });
           lastError = err;
           continue;
         }
