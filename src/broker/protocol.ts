@@ -71,6 +71,7 @@ export interface ProbeResult {
   startupError?: string;
   url?: string;
   bridgeSessionSerial?: number;
+  supportsBrokerProxy?: boolean;
 }
 
 export function parseIncomingFrame(raw: string): IncomingFrame {

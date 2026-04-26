@@ -5,9 +5,10 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import WebSocket, { type RawData } from 'ws';
+import WebSocket, { WebSocketServer, type RawData } from 'ws';
 
 import { BrowserAgentBroker } from '../src/broker/server.ts';
+import { RemoteBrowserAgentBroker } from '../src/broker/remote.ts';
 import { TaskStore } from '../src/broker/task-store.ts';
 
 async function getFreePort(): Promise<number> {
@@ -74,6 +75,212 @@ test('broker probe reports server-only and bridge-connected states', async () =>
   assert.equal(broker.probeConnectivity().bridgeVersion, '0.1.0');
 
   await broker.stop();
+});
+
+test('remote broker proxies requests through the primary broker bridge', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+
+  const bridge = new WebSocket(`ws://127.0.0.1:${port}`);
+  await new Promise<void>((resolve, reject) => {
+    bridge.once('error', reject);
+    bridge.once('open', () => {
+      bridge.send(JSON.stringify({
+        v: 1,
+        kind: 'hello',
+        extensionId: 'ext-remote-proxy-test',
+        version: '0.1.0',
+        capabilities: ['browser_list_tabs'],
+      }));
+    });
+    bridge.once('message', () => resolve());
+  });
+  bridge.on('message', (data: RawData) => {
+    const frame = JSON.parse(String(data));
+    if (frame.kind === 'request') {
+      bridge.send(JSON.stringify({
+        v: 1,
+        kind: 'response',
+        id: frame.id,
+        ok: true,
+        data: { proxied: true, type: frame.type, params: frame.params },
+      }));
+    }
+  });
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-remote-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+
+  const probe = remote.probeConnectivity();
+  assert.equal(probe.brokerListening, true);
+  assert.equal(probe.bridgeConnected, true);
+  assert.equal(probe.url, `ws://127.0.0.1:${port}`);
+
+  const response = await remote.request('browser_list_tabs', { activeOnly: false });
+  assert.equal(response.ok, true);
+  assert.equal(response.data?.proxied, true);
+  assert.equal(response.data?.type, 'browser_list_tabs');
+
+  await remote.stop();
+  bridge.close();
+  await primary.stop();
+});
+
+test('remote broker rejects a busy primary port that is not pi-browser-agent', async () => {
+  const port = await getFreePort();
+  const blocker = new WebSocketServer({ host: '127.0.0.1', port });
+  // Accept WebSocket connections but never respond to pi-browser-agent probe
+  // frames. This simulates a different websocket app owning the port.
+  blocker.on('connection', () => {});
+  await new Promise<void>((resolve) => blocker.once('listening', () => resolve()));
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-not-broker-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 500,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+
+  await assert.rejects(() => remote.start(), /not a pi-browser-agent broker/i);
+  await remote.stop();
+  await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
+});
+
+test('remote broker rejects an old pi-browser-agent primary without proxy support', async () => {
+  const port = await getFreePort();
+  const oldPrimary = new WebSocketServer({ host: '127.0.0.1', port });
+  oldPrimary.on('connection', (socket) => {
+    socket.on('message', (data) => {
+      const frame = JSON.parse(String(data));
+      if (frame.kind === 'probe') {
+        socket.send(JSON.stringify({
+          v: 1,
+          kind: 'response',
+          id: frame.id,
+          ok: true,
+          data: {
+            brokerReachable: true,
+            brokerListening: true,
+            bridgeConnected: true,
+            url: `ws://127.0.0.1:${port}`,
+            bridgeSessionSerial: 1,
+          },
+        }));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => oldPrimary.once('listening', () => resolve()));
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-old-primary-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 500,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+
+  await assert.rejects(() => remote.start(), /old pi-browser-agent broker/i);
+  await remote.stop();
+  await new Promise<void>((resolve, reject) => oldPrimary.close((error) => (error ? reject(error) : resolve())));
+});
+
+test('remote broker promotes itself when the primary broker exits', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-promote-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+  assert.equal(remote.probeConnectivity().brokerListening, true);
+
+  await primary.stop();
+
+  // Wait until the remote wins the bind race and becomes the new primary.
+  await new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + 3_000;
+    const tick = () => {
+      const probe = remote.probeConnectivity();
+      if (probe.brokerListening && probe.url === `ws://127.0.0.1:${port}` && probe.bridgeSessionSerial === 0) {
+        resolve();
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(new Error(`remote did not promote in time: ${JSON.stringify(probe)}`));
+        return;
+      }
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+
+  // Simulate Chrome reconnecting to the same stable URL (7878 in production).
+  const bridge = await new Promise<WebSocket>((resolve, reject) => {
+    const deadline = Date.now() + 3_000;
+    const tryConnect = () => {
+      const candidate = new WebSocket(`ws://127.0.0.1:${port}`);
+      let settled = false;
+      candidate.once('error', (error) => {
+        if (settled) return;
+        settled = true;
+        try { candidate.terminate(); } catch { /* ignore */ }
+        if (Date.now() > deadline) return reject(error);
+        setTimeout(tryConnect, 25);
+      });
+      candidate.once('open', () => {
+        if (settled) return;
+        settled = true;
+        candidate.send(JSON.stringify({
+          v: 1,
+          kind: 'hello',
+          extensionId: 'ext-promote-test',
+          version: '0.1.0',
+          capabilities: ['browser_list_tabs'],
+        }));
+      });
+      candidate.once('message', () => resolve(candidate));
+    };
+    tryConnect();
+  });
+  bridge.on('message', (data: RawData) => {
+    const frame = JSON.parse(String(data));
+    if (frame.kind === 'request') {
+      bridge.send(JSON.stringify({ v: 1, kind: 'response', id: frame.id, ok: true, data: { promoted: true } }));
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + 1_000;
+    const tick = () => {
+      if (remote.probeConnectivity().bridgeConnected) return resolve();
+      if (Date.now() > deadline) return reject(new Error('promoted broker bridge did not connect'));
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+
+  const response = await remote.request('browser_list_tabs', {});
+  assert.equal(response.ok, true);
+  assert.equal(response.data?.promoted, true);
+
+  bridge.close();
+  await remote.stop();
 });
 
 test('broker request/response round-trips and bridge disconnect rejects in-flight requests', async () => {

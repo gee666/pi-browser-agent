@@ -38,12 +38,14 @@ test('writeInstanceFile + listInstances round-trip and survive a process-alive c
     assert.equal(onDisk.port, 7878);
 
     const records = await listInstances();
-    assert.equal(records.length, 1);
-    assert.equal(records[0].pid, process.pid);
-    assert.equal(records[0].port, 7878);
+    const ownRecord = records.find((item) => item.pid === process.pid && item.port === 7878);
+    assert.ok(ownRecord, `expected to find own record in ${JSON.stringify(records)}`);
+    assert.equal(ownRecord.pid, process.pid);
+    assert.equal(ownRecord.port, 7878);
 
     await removeInstanceFile(process.pid);
-    assert.equal((await listInstances()).length, 0);
+    const afterRemove = await listInstances();
+    assert.equal(afterRemove.find((item) => item.pid === process.pid && item.port === 7878), undefined);
   } finally {
     guard.restore();
   }

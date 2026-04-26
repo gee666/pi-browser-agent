@@ -1,17 +1,20 @@
 import { join } from 'node:path';
 
 import { BrowserAgentBroker } from './broker/server.ts';
+import { RemoteBrowserAgentBroker } from './broker/remote.ts';
 import { TaskStore } from './broker/task-store.ts';
 import { ensureStateDir } from './util/paths.ts';
 import { listInstances, removeInstanceFile, writeInstanceFile } from './util/instances.ts';
 import { registerAllTools, resetRegisteredBrowserTools } from './tools/_register.ts';
 import { createBrowserAgentToolsTool, resetBrowserAgentToolState } from './tools/browser_agent_tools.ts';
 
-let brokerSingleton: BrowserAgentBroker | null = null;
-let brokerStartup: Promise<BrowserAgentBroker> | null = null;
+type BrowserAgentBrokerLike = BrowserAgentBroker | RemoteBrowserAgentBroker;
+
+let brokerSingleton: BrowserAgentBrokerLike | null = null;
+let brokerStartup: Promise<BrowserAgentBrokerLike> | null = null;
 let startupMessage: string | null = null;
 
-export function getBroker(): BrowserAgentBroker | null {
+export function getBroker(): BrowserAgentBrokerLike | null {
   return brokerSingleton;
 }
 
@@ -32,34 +35,71 @@ export async function resetForTests(): Promise<void> {
   startupMessage = null;
 }
 
-async function createAndStartBroker(logger: Console): Promise<BrowserAgentBroker> {
+async function createAndStartBroker(logger: Console): Promise<BrowserAgentBrokerLike> {
   const tasksDir = await ensureStateDir('tasks');
-  const broker = new BrowserAgentBroker({
+  const preferredPort = Number(process.env.PI_BA_PORT || 7878);
+  const host = process.env.PI_BA_HOST || '127.0.0.1';
+
+  // Robust multi-instance mode:
+  //   - One primary process owns the broker listener on 7878 and receives the
+  //     Chrome extension bridge.
+  //   - Secondary pi processes that lose the 7878 bind race proxy requests
+  //     through the primary broker instead of requiring Chrome to connect to
+  //     their fallback ports (fragile under MV3 service-worker sleep/backoff).
+  const primaryBroker = new BrowserAgentBroker({
+    host,
+    port: preferredPort,
+    portRange: 1,
+    fallbackToEphemeral: false,
     logger,
     taskStore: new TaskStore({ dir: join(tasksDir) }),
   });
-  // start() now throws on fatal startup failure. If we get here it bound successfully.
-  await broker.start();
-  // GC any stale instance files left behind by previous crashed runs, then
-  // publish ourselves so the browser extension can discover us regardless of
-  // which port we ended up on.
+
   try {
-    await listInstances({ gcStale: true });
-    await writeInstanceFile({
-      pid: process.pid,
-      port: broker.port,
-      host: broker.host,
-      url: broker.url,
-      cwd: process.cwd(),
-      startedAt: new Date().toISOString(),
-    });
+    await primaryBroker.start();
+    try {
+      await listInstances({ gcStale: true });
+      await writeInstanceFile({
+        pid: process.pid,
+        port: primaryBroker.port,
+        host: primaryBroker.host,
+        url: primaryBroker.url,
+        cwd: process.cwd(),
+        startedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.warn?.('[pi-browser-agent] failed to publish instance discovery file', error);
+    }
+    return primaryBroker;
   } catch (error) {
-    logger.warn?.('[pi-browser-agent] failed to publish instance discovery file', error);
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code !== 'EADDRINUSE' || process.env.PI_BA_NO_EPHEMERAL) {
+      throw error;
+    }
+
+    const remoteBroker = new RemoteBrowserAgentBroker({
+      host,
+      port: preferredPort,
+      logger,
+      taskStore: new TaskStore({ dir: join(tasksDir) }),
+    });
+    try {
+      await remoteBroker.start();
+    } catch (remoteError) {
+      const message = remoteError instanceof Error ? remoteError.message : String(remoteError);
+      if (message.includes('not a pi-browser-agent broker')) {
+        throw new Error(`Port ${preferredPort} is busy, but it is not pi-browser-agent`);
+      }
+      if (message.includes('old pi-browser-agent broker')) {
+        throw new Error(`Old browser broker on ${preferredPort}; restart the first pi instance`);
+      }
+      throw remoteError;
+    }
+    return remoteBroker;
   }
-  return broker;
 }
 
-async function getOrCreateBroker(logger: Console = console): Promise<BrowserAgentBroker> {
+async function getOrCreateBroker(logger: Console = console): Promise<BrowserAgentBrokerLike> {
   // If an existing broker is healthy, reuse it.
   if (brokerSingleton) {
     const probe = brokerSingleton.probeConnectivity();
@@ -113,7 +153,7 @@ export default async function piBrowserAgentExtension(pi: {
       }
     } catch (error) {
       startupMessage = error instanceof Error ? error.message : String(error);
-      ctx?.ui?.notify?.(`pi-browser-agent startup failed: ${startupMessage}`, 'error');
+      ctx?.ui?.notify?.(`Browser agent unavailable: ${startupMessage}`, 'error');
       // Install the meta-tool against a non-started fallback broker so the
       // session still exposes a diagnostic surface. Do NOT publish this broker
       // as the singleton — we want a real bind retry on the next session.

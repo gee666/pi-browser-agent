@@ -56,6 +56,7 @@ export class BrowserAgentBroker {
   private shutdownError: Error | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
+  private sockets = new Set<BridgeSocket>();
 
   constructor({
     host = process.env.PI_BA_HOST || '127.0.0.1',
@@ -190,6 +191,12 @@ export class BrowserAgentBroker {
           this.port = candidate;
         }
         this.server = server;
+        // Only log post-listen server errors. Startup bind errors such as an
+        // expected EADDRINUSE fallback are handled by onError and should not
+        // be printed as scary broker failures.
+        server.on('error', (error: Error) => {
+          this.logger.error?.('[pi-browser-agent] broker server error', error);
+        });
         resolve();
       };
 
@@ -197,9 +204,6 @@ export class BrowserAgentBroker {
       server.once('listening', onListening);
       server.on('connection', (socket: WebSocket) => {
         void this.handleConnection(socket);
-      });
-      server.on('error', (error: Error) => {
-        this.logger.error?.('[pi-browser-agent] broker server error', error);
       });
     });
   }
@@ -213,6 +217,14 @@ export class BrowserAgentBroker {
     }
 
     this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
+
+    for (const socket of this.sockets) {
+      try {
+        socket.close();
+      } catch (error) {
+        closeErrors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
 
     if (this.bridgeSocket) {
       try {
@@ -230,7 +242,14 @@ export class BrowserAgentBroker {
       this.server = null;
       try {
         await new Promise<void>((resolve, reject) => {
+          const forceClose = setTimeout(() => {
+            for (const socket of this.sockets) {
+              try { socket.terminate(); } catch { /* ignore */ }
+            }
+          }, 250);
+          forceClose.unref?.();
           server.close((error) => {
+            clearTimeout(forceClose);
             if (error) {
               reject(error);
               return;
@@ -297,12 +316,14 @@ export class BrowserAgentBroker {
       startupError: this.startupError?.message,
       url: this.url,
       bridgeSessionSerial: this.bridgeSessionSerial,
+      supportsBrokerProxy: true,
     };
   }
 
   private async handleConnection(socket: WebSocket): Promise<void> {
     const bridgeSocket = socket as BridgeSocket;
     bridgeSocket.isAlive = true;
+    this.sockets.add(bridgeSocket);
 
     // Do NOT evict the current bridge here. A new accepted socket has not yet
     // authenticated as a bridge session. We only replace the active bridge
@@ -318,6 +339,7 @@ export class BrowserAgentBroker {
     });
 
     bridgeSocket.on('close', () => {
+      this.sockets.delete(bridgeSocket);
       this.failBridge(bridgeSocket, new Error('E_BRIDGE_DISCONNECTED'));
     });
 
@@ -390,7 +412,22 @@ export class BrowserAgentBroker {
     }
 
     if (frame.kind === 'request') {
-      socket.send(JSON.stringify(createErrorResponseFrame(frame.id, 'E_UNKNOWN_TYPE', `Unknown request type: ${frame.type}`)));
+      // Local peer brokers use request frames to proxy browser tool calls
+      // through the primary broker's single Chrome extension bridge. The
+      // extension itself does not send request frames to the broker, so this
+      // is safe and avoids requiring Chrome/MV3 to maintain one WebSocket per
+      // pi process.
+      void this.request(frame.type, frame.params)
+        .then((response) => {
+          socket.send(JSON.stringify({ ...response, id: frame.id }));
+        })
+        .catch((error) => {
+          socket.send(JSON.stringify(createErrorResponseFrame(
+            frame.id,
+            'E_BRIDGE_DISCONNECTED',
+            error instanceof Error ? error.message : String(error),
+          )));
+        });
     }
   }
 }
