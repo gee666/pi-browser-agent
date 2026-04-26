@@ -31,11 +31,13 @@ async function getFreePort(): Promise<number> {
   });
 }
 
-async function createBroker(port: number) {
+async function createBroker(port: number, opts: { portRange?: number; fallbackToEphemeral?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-broker-'));
   return new BrowserAgentBroker({
     host: '127.0.0.1',
     port,
+    portRange: opts.portRange ?? 1,
+    fallbackToEphemeral: opts.fallbackToEphemeral ?? false,
     logger: { info() {}, warn() {}, error() {} },
     taskStore: new TaskStore({ dir: join(root, 'tasks') }),
   });
@@ -221,20 +223,72 @@ test('request rejects immediately with E_BRIDGE_DISCONNECTED if the bridge was e
   await broker.stop();
 });
 
-test('broker throws on startup failure and does not publish a non-listening server', async () => {
+test('broker throws on startup failure and does not publish a non-listening server (range=1, no ephemeral)', async () => {
   const port = await getFreePort();
   const blocker = net.createServer();
   await new Promise<void>((resolve, reject) => blocker.listen(port, '127.0.0.1', () => resolve()).once('error', reject));
 
-  const broker = await createBroker(port);
+  const broker = await createBroker(port, { portRange: 1, fallbackToEphemeral: false });
   await assert.rejects(() => broker.start(), /EADDRINUSE|address already in use/i);
 
-  // The failed broker must NOT be left in a "listening" state; probe should
-  // reflect that the bind did not succeed and the startup error is recorded.
   const probe = broker.probeConnectivity();
   assert.equal(probe.brokerReachable, false);
   assert.equal(probe.brokerListening, false);
   assert.match(probe.startupError || '', /EADDRINUSE|address already in use/i);
+
+  await broker.stop();
+  await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
+});
+
+test('broker walks port range past a busy preferred port and publishes the actual bound port', async () => {
+  const preferred = await getFreePort();
+  const blocker = net.createServer();
+  await new Promise<void>((resolve, reject) => blocker.listen(preferred, '127.0.0.1', () => resolve()).once('error', reject));
+
+  const broker = await createBroker(preferred, { portRange: 5, fallbackToEphemeral: false });
+  await broker.start();
+
+  assert.equal(broker.probeConnectivity().brokerListening, true);
+  assert.notEqual(broker.port, preferred);
+  assert.ok(broker.port > preferred && broker.port <= preferred + 4, `expected port within range, got ${broker.port}`);
+  assert.equal(broker.url, `ws://127.0.0.1:${broker.port}`);
+
+  await broker.stop();
+  await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
+});
+
+test('two brokers can run concurrently with default port range without EADDRINUSE', async () => {
+  // This is the regression test for the multi-instance hard requirement:
+  // starting a second broker while the first holds the preferred port must
+  // succeed on a different port instead of throwing.
+  const preferred = await getFreePort();
+
+  const brokerA = await createBroker(preferred, { portRange: 10, fallbackToEphemeral: true });
+  await brokerA.start();
+
+  const brokerB = await createBroker(preferred, { portRange: 10, fallbackToEphemeral: true });
+  await brokerB.start();
+
+  assert.equal(brokerA.probeConnectivity().brokerListening, true);
+  assert.equal(brokerB.probeConnectivity().brokerListening, true);
+  assert.notEqual(brokerA.port, brokerB.port);
+
+  await brokerA.stop();
+  await brokerB.stop();
+});
+
+test('broker falls back to an ephemeral port when the entire range is busy', async () => {
+  const preferred = await getFreePort();
+  const blocker = net.createServer();
+  await new Promise<void>((resolve, reject) => blocker.listen(preferred, '127.0.0.1', () => resolve()).once('error', reject));
+
+  // portRange=1 means only `preferred` itself is tried before fallback.
+  const broker = await createBroker(preferred, { portRange: 1, fallbackToEphemeral: true });
+  await broker.start();
+
+  assert.equal(broker.probeConnectivity().brokerListening, true);
+  assert.notEqual(broker.port, preferred);
+  assert.ok(broker.port > 0);
 
   await broker.stop();
   await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));

@@ -87,12 +87,19 @@ test('extension eagerly registers the full browser_* suite at session start when
 test('extension retries broker startup on a later session after a transient bind failure', async () => {
   await resetForTests();
   const originalPort = process.env.PI_BA_PORT;
+  const originalRange = process.env.PI_BA_PORT_RANGE;
+  const originalNoEph = process.env.PI_BA_NO_EPHEMERAL;
   const blockedPort = await getFreePort();
   const blocker = net.createServer();
 
   try {
     await new Promise<void>((resolve, reject) => blocker.listen(blockedPort, '127.0.0.1', () => resolve()).once('error', reject));
     process.env.PI_BA_PORT = String(blockedPort);
+    // Force the legacy single-port-no-fallback behaviour so this test still
+    // exercises the "transient bind failure" path. With the default range +
+    // ephemeral fallback the broker would always succeed.
+    process.env.PI_BA_PORT_RANGE = '1';
+    process.env.PI_BA_NO_EPHEMERAL = '1';
 
     const pi = createPiHarness();
     await extension(pi as any);
@@ -119,6 +126,16 @@ test('extension retries broker startup on a later session after a transient bind
       delete process.env.PI_BA_PORT;
     } else {
       process.env.PI_BA_PORT = originalPort;
+    }
+    if (originalRange === undefined) {
+      delete process.env.PI_BA_PORT_RANGE;
+    } else {
+      process.env.PI_BA_PORT_RANGE = originalRange;
+    }
+    if (originalNoEph === undefined) {
+      delete process.env.PI_BA_NO_EPHEMERAL;
+    } else {
+      process.env.PI_BA_NO_EPHEMERAL = originalNoEph;
     }
   }
 });

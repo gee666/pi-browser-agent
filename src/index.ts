@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { BrowserAgentBroker } from './broker/server.ts';
 import { TaskStore } from './broker/task-store.ts';
 import { ensureStateDir } from './util/paths.ts';
+import { listInstances, removeInstanceFile, writeInstanceFile } from './util/instances.ts';
 import { registerAllTools, resetRegisteredBrowserTools } from './tools/_register.ts';
 import { createBrowserAgentToolsTool, resetBrowserAgentToolState } from './tools/browser_agent_tools.ts';
 
@@ -39,6 +40,22 @@ async function createAndStartBroker(logger: Console): Promise<BrowserAgentBroker
   });
   // start() now throws on fatal startup failure. If we get here it bound successfully.
   await broker.start();
+  // GC any stale instance files left behind by previous crashed runs, then
+  // publish ourselves so the browser extension can discover us regardless of
+  // which port we ended up on.
+  try {
+    await listInstances({ gcStale: true });
+    await writeInstanceFile({
+      pid: process.pid,
+      port: broker.port,
+      host: broker.host,
+      url: broker.url,
+      cwd: process.cwd(),
+      startedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.warn?.('[pi-browser-agent] failed to publish instance discovery file', error);
+  }
   return broker;
 }
 
@@ -127,6 +144,13 @@ export default async function piBrowserAgentExtension(pi: {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx?.ui?.notify?.(`pi-browser-agent shutdown failed: ${message}`, 'warning');
+    } finally {
+      try {
+        await removeInstanceFile(process.pid);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx?.ui?.notify?.(`pi-browser-agent instance cleanup failed: ${message}`, 'warning');
+      }
     }
   });
 }

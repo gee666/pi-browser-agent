@@ -28,9 +28,22 @@ interface PendingRequest {
   timeout: ReturnType<typeof setTimeout>;
 }
 
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export class BrowserAgentBroker {
   readonly host: string;
-  readonly port: number;
+  /** Port the broker actually bound to. Equals `preferredPort` after a clean
+   *  bind on the first try; otherwise the first free port in the range, or an
+   *  OS-assigned ephemeral port if every candidate was busy. Updated by
+   *  `start()` once the underlying server is listening. */
+  port: number;
+  readonly preferredPort: number;
+  readonly portRange: number;
+  readonly fallbackToEphemeral: boolean;
   readonly logger: BrokerLogger;
   readonly requestTimeoutMs: number;
   readonly taskStore: TaskStore;
@@ -46,19 +59,31 @@ export class BrowserAgentBroker {
 
   constructor({
     host = process.env.PI_BA_HOST || '127.0.0.1',
-    port = Number(process.env.PI_BA_PORT || 7878),
+    port = parsePositiveInt(process.env.PI_BA_PORT, 7878),
+    portRange = parsePositiveInt(process.env.PI_BA_PORT_RANGE, 20),
+    fallbackToEphemeral = process.env.PI_BA_NO_EPHEMERAL ? false : true,
     logger = console,
     requestTimeoutMs = 10_000,
     taskStore,
   }: {
     host?: string;
     port?: number;
+    /** Number of consecutive ports to try starting at `port` before falling
+     *  back to an OS-assigned ephemeral port. Defaults to 20. Set to 1 to
+     *  preserve the legacy single-port behaviour. */
+    portRange?: number;
+    /** If every port in the range is busy, bind to port 0 (OS-assigned).
+     *  Defaults to true. Set `PI_BA_NO_EPHEMERAL=1` to disable. */
+    fallbackToEphemeral?: boolean;
     logger?: BrokerLogger;
     requestTimeoutMs?: number;
     taskStore: TaskStore;
   }) {
     this.host = host;
+    this.preferredPort = port;
     this.port = port;
+    this.portRange = Math.max(1, portRange);
+    this.fallbackToEphemeral = fallbackToEphemeral;
     this.logger = logger;
     this.requestTimeoutMs = requestTimeoutMs;
     this.taskStore = taskStore;
@@ -78,35 +103,7 @@ export class BrowserAgentBroker {
     try {
       await this.taskStore.init();
       await this.taskStore.gc();
-      await new Promise<void>((resolve, reject) => {
-        const server = new WebSocketServer({ host: this.host, port: this.port });
-
-        const onError = (error: Error) => {
-          server.off('listening', onListening);
-          // Startup failed; do not publish the server as the broker's listener.
-          this.server = null;
-          try {
-            server.close();
-          } catch {
-            // ignore; server never finished binding
-          }
-          reject(error);
-        };
-        const onListening = () => {
-          server.off('error', onError);
-          this.server = server;
-          resolve();
-        };
-
-        server.once('error', onError);
-        server.once('listening', onListening);
-        server.on('connection', (socket: WebSocket) => {
-          void this.handleConnection(socket);
-        });
-        server.on('error', (error: Error) => {
-          this.logger.error?.('[pi-browser-agent] broker server error', error);
-        });
-      });
+      await this.bindWithFallback();
 
       this.pingTimer = setInterval(() => {
         const socket = this.bridgeSocket as BridgeSocket | null;
@@ -131,12 +128,80 @@ export class BrowserAgentBroker {
         }
       }, 25_000);
       this.pingTimer.unref?.();
-      this.logger.info?.('[pi-browser-agent] broker listening', { url: this.url });
+      this.logger.info?.('[pi-browser-agent] broker listening', { url: this.url, preferredPort: this.preferredPort });
     } catch (error) {
       this.startupError = error instanceof Error ? error : new Error(String(error));
       this.logger.error?.('[pi-browser-agent] broker startup failed', this.startupError);
       throw this.startupError;
     }
+  }
+
+  /** Try to bind to the preferred port, walk up the configured range on
+   *  EADDRINUSE, and finally fall back to an OS-assigned ephemeral port.
+   *  Updates `this.port` to the actual bound port on success. */
+  private async bindWithFallback(): Promise<void> {
+    const candidates: number[] = [];
+    for (let i = 0; i < this.portRange; i += 1) {
+      candidates.push(this.preferredPort + i);
+    }
+    if (this.fallbackToEphemeral) {
+      candidates.push(0);
+    }
+
+    let lastError: Error | null = null;
+    for (const candidate of candidates) {
+      try {
+        await this.tryBind(candidate);
+        return;
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'EADDRINUSE') {
+          this.logger.warn?.('[pi-browser-agent] port busy, trying next candidate', { tried: candidate });
+          lastError = err;
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastError ?? new Error('Failed to bind broker to any candidate port');
+  }
+
+  private async tryBind(candidate: number): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const server = new WebSocketServer({ host: this.host, port: candidate });
+
+      const onError = (error: Error) => {
+        server.off('listening', onListening);
+        this.server = null;
+        try {
+          server.close();
+        } catch {
+          // ignore; server never finished binding
+        }
+        reject(error);
+      };
+      const onListening = () => {
+        server.off('error', onError);
+        const address = server.address();
+        if (address && typeof address === 'object') {
+          this.port = address.port;
+        } else {
+          this.port = candidate;
+        }
+        this.server = server;
+        resolve();
+      };
+
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.on('connection', (socket: WebSocket) => {
+        void this.handleConnection(socket);
+      });
+      server.on('error', (error: Error) => {
+        this.logger.error?.('[pi-browser-agent] broker server error', error);
+      });
+    });
   }
 
   async stop(): Promise<void> {
