@@ -1,6 +1,6 @@
 {
   "name": "oira666_pi-browser-agent",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "private": false,
   "type": "module",
   "description": "Pi browser agent broker skeleton with lazy browser tool registration",

@@ -129,7 +129,6 @@ export class BrowserAgentBroker {
         }
       }, 25_000);
       this.pingTimer.unref?.();
-      this.logger.info?.('[pi-browser-agent] broker listening', { url: this.url, preferredPort: this.preferredPort });
     } catch (error) {
       this.startupError = error instanceof Error ? error : new Error(String(error));
       const code = (this.startupError as NodeJS.ErrnoException).code;
