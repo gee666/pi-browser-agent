@@ -132,7 +132,9 @@ export class BrowserAgentBroker {
     } catch (error) {
       this.startupError = error instanceof Error ? error : new Error(String(error));
       const code = (this.startupError as NodeJS.ErrnoException).code;
-      if (code !== 'EADDRINUSE') {
+      if (code === 'EADDRINUSE') {
+        this.logger.warn?.('[pi-browser-agent] primary broker port is busy', { port: this.preferredPort });
+      } else {
         this.logger.error?.('[pi-browser-agent] broker startup failed', this.startupError);
       }
       throw this.startupError;

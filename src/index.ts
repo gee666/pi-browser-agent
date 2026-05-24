@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 
-import { BrowserAgentBroker } from './broker/server.ts';
+import { BrowserAgentBroker, type BrokerLogger } from './broker/server.ts';
 import { RemoteBrowserAgentBroker } from './broker/remote.ts';
 import { TaskStore } from './broker/task-store.ts';
 import { ensureStateDir } from './util/paths.ts';
@@ -9,6 +9,11 @@ import { registerAllTools, resetRegisteredBrowserTools } from './tools/_register
 import { createBrowserAgentToolsTool, resetBrowserAgentToolState } from './tools/browser_agent_tools.ts';
 
 type BrowserAgentBrokerLike = BrowserAgentBroker | RemoteBrowserAgentBroker;
+type ExtensionUi = {
+  notify?: (message: string, type?: 'info' | 'warning' | 'error') => void;
+  setStatus?: (key: string, text: string | undefined) => void;
+};
+type ExtensionContextLike = { ui?: ExtensionUi };
 
 let brokerSingleton: BrowserAgentBrokerLike | null = null;
 let brokerStartup: Promise<BrowserAgentBrokerLike> | null = null;
@@ -35,7 +40,41 @@ export async function resetForTests(): Promise<void> {
   startupMessage = null;
 }
 
-async function createAndStartBroker(logger: Console): Promise<BrowserAgentBrokerLike> {
+function formatLogArg(value: unknown): string {
+  if (value instanceof Error) {
+    return value.stack || value.message;
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function createUiLogger(ctx?: ExtensionContextLike): BrokerLogger {
+  const notify = ctx?.ui?.notify;
+  if (typeof notify !== 'function') {
+    return { info() {}, warn() {}, error() {} };
+  }
+
+  const emit = (type: 'info' | 'warning' | 'error', args: unknown[]) => {
+    const message = args.map(formatLogArg).filter(Boolean).join(' ');
+    if (message) {
+      notify(message, type);
+    }
+  };
+
+  return {
+    info: (...args: unknown[]) => emit('info', args),
+    warn: (...args: unknown[]) => emit('warning', args),
+    error: (...args: unknown[]) => emit('error', args),
+  };
+}
+
+async function createAndStartBroker(logger: BrokerLogger): Promise<BrowserAgentBrokerLike> {
   const tasksDir = await ensureStateDir('tasks');
   const preferredPort = Number(process.env.PI_BA_PORT || 7878);
   const host = process.env.PI_BA_HOST || '127.0.0.1';
@@ -99,7 +138,7 @@ async function createAndStartBroker(logger: Console): Promise<BrowserAgentBroker
   }
 }
 
-async function getOrCreateBroker(logger: Console = console): Promise<BrowserAgentBrokerLike> {
+async function getOrCreateBroker(logger: BrokerLogger): Promise<BrowserAgentBrokerLike> {
   // If an existing broker is healthy, reuse it.
   if (brokerSingleton) {
     const probe = brokerSingleton.probeConnectivity();
@@ -131,15 +170,16 @@ async function getOrCreateBroker(logger: Console = console): Promise<BrowserAgen
 }
 
 export default async function piBrowserAgentExtension(pi: {
-  on: (event: string, handler: (_event: unknown, ctx?: { ui?: { notify?: (message: string, type?: string) => void } }) => Promise<void> | void) => void;
+  on: (event: string, handler: (_event: unknown, ctx?: ExtensionContextLike) => Promise<void> | void) => void;
   registerTool: (tool: any) => void;
 }) {
-  const registerSessionTool = async (ctx?: { ui?: { notify?: (message: string, type?: string) => void } }) => {
+  const registerSessionTool = async (ctx?: ExtensionContextLike) => {
     resetBrowserAgentToolState();
     resetRegisteredBrowserTools();
+    const logger = createUiLogger(ctx);
 
     try {
-      const broker = await getOrCreateBroker();
+      const broker = await getOrCreateBroker(logger);
       startupMessage = null;
       pi.registerTool(createBrowserAgentToolsTool(pi, broker));
       // pi reads the tool registry at session_start; any later registerTool()
@@ -158,6 +198,7 @@ export default async function piBrowserAgentExtension(pi: {
       // session still exposes a diagnostic surface. Do NOT publish this broker
       // as the singleton — we want a real bind retry on the next session.
       const fallbackBroker = new BrowserAgentBroker({
+        logger,
         taskStore: new TaskStore({ dir: join(await ensureStateDir('tasks')) }),
       });
       pi.registerTool(createBrowserAgentToolsTool(pi, fallbackBroker));

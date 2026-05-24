@@ -140,6 +140,51 @@ test('extension retries broker startup on a later session after a transient bind
   }
 });
 
+test('broker startup diagnostics are routed through the extension UI context', async () => {
+  await resetForTests();
+  const originalPort = process.env.PI_BA_PORT;
+  const originalRange = process.env.PI_BA_PORT_RANGE;
+  const originalNoEph = process.env.PI_BA_NO_EPHEMERAL;
+  const blockedPort = await getFreePort();
+  const blocker = net.createServer();
+  const notifications: Array<{ message: string; type?: string }> = [];
+
+  try {
+    await new Promise<void>((resolve, reject) => blocker.listen(blockedPort, '127.0.0.1', () => resolve()).once('error', reject));
+    process.env.PI_BA_PORT = String(blockedPort);
+    process.env.PI_BA_PORT_RANGE = '1';
+    process.env.PI_BA_NO_EPHEMERAL = '1';
+
+    const pi = createPiHarness();
+    await extension(pi as any);
+    const sessionStart = pi.handlers.get('session_start');
+
+    await sessionStart({}, { ui: { notify: (message: string, type?: string) => notifications.push({ message, type }) } });
+
+    assert.equal(getBroker(), null);
+    assert.ok(notifications.some((entry) => entry.type === 'warning' && entry.message.includes('primary broker port is busy')));
+    assert.ok(notifications.some((entry) => entry.type === 'error' && entry.message.includes('Browser agent unavailable')));
+  } finally {
+    await resetForTests();
+    await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    if (originalPort === undefined) {
+      delete process.env.PI_BA_PORT;
+    } else {
+      process.env.PI_BA_PORT = originalPort;
+    }
+    if (originalRange === undefined) {
+      delete process.env.PI_BA_PORT_RANGE;
+    } else {
+      process.env.PI_BA_PORT_RANGE = originalRange;
+    }
+    if (originalNoEph === undefined) {
+      delete process.env.PI_BA_NO_EPHEMERAL;
+    } else {
+      process.env.PI_BA_NO_EPHEMERAL = originalNoEph;
+    }
+  }
+});
+
 test('overlapping session_start calls yield a single shared broker instance', async () => {
   await resetForTests();
   const originalPort = process.env.PI_BA_PORT;
