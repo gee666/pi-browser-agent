@@ -4,10 +4,12 @@ import assert from 'node:assert/strict';
 import type { ResponseFrame } from '../../src/broker/protocol.ts';
 import {
   browserClearSiteDataDefinition,
+  browserCreateTabDefinition,
   browserEvaluateJsDefinition,
   browserRunJsDefinition,
   createBrowserClearSiteDataTool,
   createBrowserCloseTabTool,
+  createBrowserCreateTabTool,
   createBrowserEvaluateJsTool,
   createBrowserJsNavigationToolFamily,
   createBrowserNavigateTool,
@@ -35,6 +37,7 @@ test('tool family builders expose all expected JS/navigation/destructive tools',
   assert.deepEqual(family, [
     'browser_evaluate_js',
     'browser_run_js',
+    'browser_create_tab',
     'browser_navigate',
     'browser_switch_tab',
     'browser_close_tab',
@@ -44,6 +47,7 @@ test('tool family builders expose all expected JS/navigation/destructive tools',
   ]);
   assert.equal('url' in (browserEvaluateJsDefinition.parameters as any).properties, false);
   assert.equal('url' in (browserRunJsDefinition.parameters as any).properties, false);
+  assert.equal('url' in (browserCreateTabDefinition.parameters as any).properties, true);
   assert.equal((browserClearSiteDataDefinition.parameters as any).properties.types.minItems, 1);
 });
 
@@ -89,6 +93,30 @@ test('browser_run_js returns structured bridge failures instead of throwing', as
   assert.equal(result.details.ok, false);
   assert.equal((result.details as any).error.code, 'E_TIMEOUT');
   assert.match(textOf(result), /browser_run_js failed/);
+});
+
+test('browser_create_tab returns a tab id without defaulting to the active tab', async () => {
+  let captured: { type: string; params: any; timeoutMs?: number } | null = null;
+  const broker = createBrokerStub(async (type, params, options) => {
+    captured = { type, params, timeoutMs: options.timeoutMs };
+    return {
+      v: 1,
+      kind: 'response',
+      id: 'create-tab',
+      ok: true,
+      data: { tabId: 15, url: 'https://example.com/own', title: 'Own tab', active: false, pinned: false },
+    };
+  });
+
+  const result = await createBrowserCreateTabTool(broker).execute('call-create', { url: 'https://example.com/own', timeout_ms: 1234 });
+
+  const recorded = captured as any;
+  assert.equal(recorded.type, 'browser_create_tab');
+  assert.equal(recorded.params.url, 'https://example.com/own');
+  assert.equal(recorded.params.use_active_tab, undefined);
+  assert.equal(recorded.timeoutMs, 2234);
+  assert.equal(result.details.ok, true);
+  assert.match(textOf(result), /Created tab 15/);
 });
 
 test('navigation/destructive tool builders pass through successful bridge responses and default relevant tools to the active tab', async () => {

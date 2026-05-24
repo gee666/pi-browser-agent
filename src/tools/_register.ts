@@ -24,6 +24,7 @@ const PLACEHOLDER_TOOL_SPECS = [
   ['browser_get_performance_metrics', 'Read performance metrics.'],
   ['browser_evaluate_js', 'Evaluate a JavaScript expression in the page.'],
   ['browser_run_js', 'Run longer JavaScript in the page.'],
+  ['browser_create_tab', 'Create a new browser tab.'],
   ['browser_list_tabs', 'List browser tabs.'],
   ['browser_switch_tab', 'Switch to a browser tab.'],
   ['browser_close_tab', 'Close a browser tab.'],

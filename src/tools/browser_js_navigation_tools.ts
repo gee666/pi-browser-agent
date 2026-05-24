@@ -93,10 +93,12 @@ function withClearSiteDataTarget(params: Record<string, unknown>) {
 
 function createSuccessText(name: string, data: any, spill?: { text: string; truncated: boolean; fullOutputPath?: string }) {
   const headline =
-    name === 'browser_navigate'
-      ? `Navigated tab ${data?.tabId ?? 'unknown'} to ${data?.url ?? data?.requestedUrl ?? 'unknown URL'}.`
-      : name === 'browser_switch_tab'
-        ? `Switched to tab ${data?.tabId ?? 'unknown'}.`
+    name === 'browser_create_tab'
+      ? `Created tab ${data?.tabId ?? 'unknown'} at ${data?.url ?? 'unknown URL'}.`
+      : name === 'browser_navigate'
+        ? `Navigated tab ${data?.tabId ?? 'unknown'} to ${data?.url ?? data?.requestedUrl ?? 'unknown URL'}.`
+        : name === 'browser_switch_tab'
+          ? `Switched to tab ${data?.tabId ?? 'unknown'}.`
         : name === 'browser_close_tab'
           ? `Closed tab ${data?.tabId ?? 'unknown'}.`
           : name === 'browser_reload'
@@ -124,6 +126,7 @@ function validateSuccessPayload(name: string, data: any): { code: string; messag
     return { code: 'E_PROTOCOL', message: `${name} response payload was missing`, details: { data } };
   }
   const needsTabId = new Set([
+    'browser_create_tab',
     'browser_navigate',
     'browser_switch_tab',
     'browser_close_tab',
@@ -133,6 +136,9 @@ function validateSuccessPayload(name: string, data: any): { code: string; messag
   ]);
   if (needsTabId.has(name) && typeof (data as any).tabId !== 'number') {
     return { code: 'E_PROTOCOL', message: `${name} response did not include tabId`, details: { data } };
+  }
+  if (name === 'browser_create_tab' && typeof (data as any).url !== 'string') {
+    return { code: 'E_PROTOCOL', message: 'browser_create_tab response did not include url', details: { data } };
   }
   if (name === 'browser_navigate' && typeof (data as any).url !== 'string' && typeof (data as any).requestedUrl !== 'string') {
     return { code: 'E_PROTOCOL', message: 'browser_navigate response did not include url', details: { data } };
@@ -261,6 +267,25 @@ export const browserRunJsDefinition = {
   }),
 } as const;
 
+export const browserCreateTabDefinition = {
+  name: 'browser_create_tab',
+  description: 'Create a new browser tab and return its tab id for later browser tool calls.',
+  promptSnippet: 'Create a new browser tab for isolated browser work. Use the returned tab_id in later browser tool calls.',
+  parameters: Type.Object({
+    url: Type.Optional(Type.String({ format: 'uri', minLength: 1 })),
+    active: Type.Optional(Type.Boolean({ default: false })),
+    pinned: Type.Optional(Type.Boolean({ default: false })),
+    window_id: Type.Optional(Type.Number()),
+    wait_until: Type.Optional(Type.Union([
+      Type.Literal('load'),
+      Type.Literal('networkidle'),
+      Type.Literal('settle'),
+      Type.Literal('none'),
+    ], { default: 'load' })),
+    timeout_ms: Type.Optional(Type.Number({ minimum: 1, default: 30_000 })),
+  }),
+} as const;
+
 export const browserNavigateDefinition = {
   name: 'browser_navigate',
   description: 'Navigate a browser tab to a URL and wait for it to settle.',
@@ -360,6 +385,11 @@ export const createBrowserRunJsTool = createRequestTool({
   timeoutFromParams: (params) => Number(params.timeout_ms ?? 30_000) + 1_000,
 });
 
+export const createBrowserCreateTabTool = createRequestTool({
+  ...browserCreateTabDefinition,
+  timeoutFromParams: (params) => Number(params.timeout_ms ?? 30_000) + 1_000,
+});
+
 export const createBrowserNavigateTool = createRequestTool({
   ...browserNavigateDefinition,
   timeoutFromParams: (params) => Number(params.timeout_ms ?? 30_000) + 1_000,
@@ -448,6 +478,7 @@ export function createBrowserJsNavigationToolFamily(broker: BrowserAgentBroker) 
   return [
     createBrowserEvaluateJsTool(broker),
     createBrowserRunJsTool(broker),
+    createBrowserCreateTabTool(broker),
     createBrowserNavigateTool(broker),
     createBrowserSwitchTabTool(broker),
     createBrowserCloseTabTool(broker),
