@@ -12,7 +12,7 @@ import { truncateAndSpill } from '../../util/truncate.ts';
 
 export type ToolResultContentBlock =
   | { type: 'text'; text: string }
-  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+  | { type: 'image'; source: { base64: { media_type: string; data: string } } };
 
 export interface ToolResult {
   content: ToolResultContentBlock[];
@@ -54,9 +54,10 @@ export function imageResult(text: string, image: { mime: string; dataBase64: str
       {
         type: 'image',
         source: {
-          type: 'base64',
-          media_type: image.mime,
-          data: image.dataBase64,
+          base64: {
+            media_type: image.mime,
+            data: image.dataBase64,
+          },
         },
       },
     ],
