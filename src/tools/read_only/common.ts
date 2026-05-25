@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,6 +9,10 @@ import type { TSchema } from '@sinclair/typebox';
 import type { BrowserAgentBroker } from '../../broker/server.ts';
 import type { ResponseFrame } from '../../broker/protocol.ts';
 import { truncateAndSpill } from '../../util/truncate.ts';
+
+const SCREENSHOT_TEMP_DIR = join(tmpdir(), 'pi-browser-agent', 'screenshots');
+const SCREENSHOT_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+let screenshotCleanupStarted = false;
 
 export type ToolResultContentBlock =
   | { type: 'text'; text: string }
@@ -143,8 +147,45 @@ export async function formatTextResult(title: string, value: string, ext = 'txt'
   };
 }
 
+async function cleanupOldScreenshotTempFiles(): Promise<void> {
+  const now = Date.now();
+  let entries: string[];
+  try {
+    entries = await readdir(SCREENSHOT_TEMP_DIR);
+  } catch {
+    return;
+  }
+
+  await Promise.all(entries.map(async (entry) => {
+    const path = join(SCREENSHOT_TEMP_DIR, entry);
+    try {
+      const info = await stat(path);
+      if (!info.isFile()) {
+        return;
+      }
+      const createdAt = Number.isFinite(info.birthtimeMs) && info.birthtimeMs > 0 ? info.birthtimeMs : info.mtimeMs;
+      if (now - createdAt > SCREENSHOT_TEMP_MAX_AGE_MS) {
+        await rm(path, { force: true });
+      }
+    } catch {
+      // Best-effort cleanup only; never fail the screenshot tool because temp cleanup failed.
+    }
+  }));
+}
+
+function startScreenshotTempCleanup(): void {
+  if (screenshotCleanupStarted) {
+    return;
+  }
+  screenshotCleanupStarted = true;
+  void cleanupOldScreenshotTempFiles();
+}
+
 export async function spillBase64Payload(base64: string, ext: string): Promise<string> {
-  const path = join(tmpdir(), `pi-browser-agent-${randomBytes(6).toString('hex')}.${ext}`);
+  startScreenshotTempCleanup();
+  await mkdir(SCREENSHOT_TEMP_DIR, { recursive: true });
+  const safeExt = /^[a-z0-9]+$/i.test(ext) ? ext : 'bin';
+  const path = join(SCREENSHOT_TEMP_DIR, `screenshot-${randomBytes(6).toString('hex')}.${safeExt}`);
   await writeFile(path, Buffer.from(base64, 'base64'));
   return path;
 }
