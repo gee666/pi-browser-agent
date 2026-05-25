@@ -87,8 +87,8 @@ test('browser_get_screenshot returns screenshots as image content and never expo
   assert.equal(result.details.imageAttached, true);
   assert.equal(result.details.spilledToFile, true);
   assert.equal((result.content?.[1] as any)?.type, 'image');
-  assert.equal((result.content?.[1] as any)?.source?.base64?.media_type, 'image/jpeg');
-  assert.equal((result.content?.[1] as any)?.source?.base64?.data, largeBase64);
+  assert.equal((result.content?.[1] as any)?.mimeType, 'image/jpeg');
+  assert.equal((result.content?.[1] as any)?.data, largeBase64);
   assert.equal((result.details.result as any).data_base64, undefined);
   assert.equal((result.details.response as any).data.data_base64, undefined);
 
