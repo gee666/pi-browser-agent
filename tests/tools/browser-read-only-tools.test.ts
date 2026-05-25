@@ -62,7 +62,7 @@ test('browser_get_html truncates oversized HTML and spills the full output to a 
   await rm(spillPath, { force: true });
 });
 
-test('browser_get_screenshot spills large inline payloads to a temp file', async () => {
+test('browser_get_screenshot returns screenshots as image content and never exposes base64 in details', async () => {
   const largeBase64 = Buffer.alloc(300 * 1024, 7).toString('base64');
   const tools = createReadOnlyBrowserToolMap(createBrokerHarness(async (type) => {
     assert.equal(type, 'browser_get_screenshot');
@@ -84,9 +84,13 @@ test('browser_get_screenshot spills large inline payloads to a temp file', async
 
   const result = await tools.get('browser_get_screenshot')!.execute('call-1', {});
   assert.equal(result.details.ok, true);
-  assert.equal(result.details.inlined, false);
+  assert.equal(result.details.imageAttached, true);
   assert.equal(result.details.spilledToFile, true);
+  assert.equal((result.content?.[1] as any)?.type, 'image');
+  assert.equal((result.content?.[1] as any)?.source?.media_type, 'image/jpeg');
+  assert.equal((result.content?.[1] as any)?.source?.data, largeBase64);
   assert.equal((result.details.result as any).data_base64, undefined);
+  assert.equal((result.details.response as any).data.data_base64, undefined);
 
   const spillPath = String((result.details.result as any).path);
   const spilled = await readFile(spillPath);

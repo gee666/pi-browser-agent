@@ -10,8 +10,12 @@ import type { BrowserAgentBroker } from '../../broker/server.ts';
 import type { ResponseFrame } from '../../broker/protocol.ts';
 import { truncateAndSpill } from '../../util/truncate.ts';
 
+export type ToolResultContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
 export interface ToolResult {
-  content: Array<{ type: 'text'; text: string }>;
+  content: ToolResultContentBlock[];
   details: Record<string, unknown>;
 }
 
@@ -39,6 +43,23 @@ export class BrowserReadOnlyToolError extends Error {
 export function textResult(text: string, details: Record<string, unknown>): ToolResult {
   return {
     content: [{ type: 'text', text }],
+    details,
+  };
+}
+
+export function imageResult(text: string, image: { mime: string; dataBase64: string }, details: Record<string, unknown>): ToolResult {
+  return {
+    content: [
+      { type: 'text', text },
+      {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: image.mime,
+          data: image.dataBase64,
+        },
+      },
+    ],
     details,
   };
 }

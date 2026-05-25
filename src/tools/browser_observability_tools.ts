@@ -8,11 +8,7 @@ import {
   requestBridge,
   textResult,
 } from './read_only/common.ts';
-
-interface ToolResult {
-  content: Array<{ type: 'text'; text: string }>;
-  details: Record<string, unknown>;
-}
+import type { ToolResult } from './read_only/common.ts';
 
 function withDefaultActiveTabTarget(params: Record<string, unknown>) {
   if (typeof params.tab_id === 'number' || typeof params.url === 'string' || params.use_active_tab === true) {

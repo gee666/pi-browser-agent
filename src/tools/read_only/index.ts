@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+
 import { Type } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../../broker/server.ts';
@@ -8,6 +10,7 @@ import {
   defaultTimeoutMs,
   formatJsonResult,
   formatTextResult,
+  imageResult,
   inferFileExtensionFromMime,
   normalizeScreenshotPayload,
   requestBridge,
@@ -15,7 +18,7 @@ import {
   textResult,
 } from './common.ts';
 
-const SCREENSHOT_INLINE_LIMIT_BYTES = 256 * 1024;
+const SCREENSHOT_IMAGE_CONTENT_LIMIT_BYTES = 5 * 1024 * 1024;
 
 function levelsType() {
   return Type.Array(Type.Union([
@@ -81,6 +84,21 @@ function createJsonReadOnlyTool<TParams>(
   };
 }
 
+function redactScreenshotResponse(response: any): any {
+  if (!response || typeof response !== 'object' || !response.data || typeof response.data !== 'object') {
+    return response;
+  }
+
+  return {
+    ...response,
+    data: {
+      ...response.data,
+      data_base64: undefined,
+      dataBase64: undefined,
+    },
+  };
+}
+
 function createScreenshotTool(broker: BrowserAgentBroker): ReadOnlyToolDefinition<any> {
   return {
     name: 'browser_get_screenshot',
@@ -107,30 +125,44 @@ function createScreenshotTool(broker: BrowserAgentBroker): ReadOnlyToolDefinitio
         const normalized = normalizeScreenshotPayload(data);
         let path = normalized.path;
         let dataBase64 = normalized.data_base64;
-        const inlineBytes = dataBase64 ? Buffer.byteLength(dataBase64, 'base64') : 0;
+        let imageBytes = dataBase64 ? Buffer.byteLength(dataBase64, 'base64') : 0;
 
-        if (!path && dataBase64 && inlineBytes > SCREENSHOT_INLINE_LIMIT_BYTES) {
-          path = await spillBase64Payload(dataBase64, inferFileExtensionFromMime(normalized.mime));
-          dataBase64 = undefined;
+        if (!dataBase64 && path) {
+          const buffer = await readFile(path);
+          imageBytes = buffer.length;
+          if (imageBytes <= SCREENSHOT_IMAGE_CONTENT_LIMIT_BYTES) {
+            dataBase64 = buffer.toString('base64');
+          }
         }
 
-        const location = path ? `saved to ${path}` : `returned inline (${inlineBytes} bytes)`;
-        return textResult(
-          `Captured screenshot for ${normalized.title || normalized.url || 'tab'}; ${location}.`,
-          {
-            ok: true,
-            requestType: 'browser_get_screenshot',
-            response,
-            result: {
-              ...normalized,
-              data_base64: dataBase64,
-              path,
-            },
-            inlined: !!dataBase64,
-            spilledToFile: !!path,
-            inlineBytes,
+        if (!path && dataBase64) {
+          path = await spillBase64Payload(dataBase64, inferFileExtensionFromMime(normalized.mime));
+        }
+
+        const canAttachImage = !!dataBase64 && imageBytes <= SCREENSHOT_IMAGE_CONTENT_LIMIT_BYTES;
+        const location = path ? `saved to ${path}` : `captured ${imageBytes} bytes`;
+        const text = canAttachImage
+          ? `Captured screenshot for ${normalized.title || normalized.url || 'tab'}; attached as an image (${imageBytes} bytes). ${location}.`
+          : `Captured screenshot for ${normalized.title || normalized.url || 'tab'}; image is too large to attach (${imageBytes} bytes), ${location}.`;
+        const details = {
+          ok: true,
+          requestType: 'browser_get_screenshot',
+          response: redactScreenshotResponse(response),
+          result: {
+            ...normalized,
+            data_base64: undefined,
+            path,
           },
-        );
+          imageAttached: canAttachImage,
+          spilledToFile: !!path,
+          imageBytes,
+        };
+
+        if (canAttachImage) {
+          return imageResult(text, { mime: normalized.mime, dataBase64 }, details);
+        }
+
+        return textResult(text, details);
       } catch (error) {
         const info = coerceError(error);
         return textResult(`browser_get_screenshot failed: ${info.message}`, {
