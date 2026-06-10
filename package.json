@@ -3,6 +3,7 @@
   "version": "0.0.10",
   "private": false,
   "type": "module",
+  "license": "Apache-2.0",
   "description": "Pi browser agent broker skeleton with lazy browser tool registration",
   "repository": {
     "type": "git",
