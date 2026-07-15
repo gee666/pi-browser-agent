@@ -138,6 +138,87 @@ async function createAndStartBroker(logger: BrokerLogger): Promise<BrowserAgentB
   }
 }
 
+let signalHandlersInstalled = false;
+let suspending = false;
+
+/**
+ * Make Ctrl+Z (SIGTSTP) graceful.
+ *
+ * By default a suspended process keeps its TCP listener bound while frozen, so
+ * the primary broker would hold port 7878 (and the Chrome extension bridge)
+ * hostage without ever servicing it. That wedges every other pi process, which
+ * proxies through the primary. Instead we intercept SIGTSTP, cleanly stop the
+ * broker (freeing the port and closing the bridge so secondaries auto-promote
+ * a new primary via RemoteBrowserAgentBroker.promoteOrReconnect), and only then
+ * actually suspend via SIGSTOP (which cannot be caught, so it truly stops the
+ * process like the default Ctrl+Z). On SIGCONT we re-acquire the broker.
+ */
+function installSuspendResumeHandlers(): void {
+  if (signalHandlersInstalled) return;
+  // SIGTSTP/SIGCONT are POSIX-only; nothing to do on Windows.
+  if (process.platform === 'win32') return;
+  signalHandlersInstalled = true;
+
+  process.on('SIGTSTP', () => {
+    if (suspending) return;
+    suspending = true;
+    const broker = brokerSingleton;
+    void (async () => {
+      try {
+        // Abort any in-flight startup and release the port + bridge.
+        brokerStartup = null;
+        if (broker) {
+          await broker.stop();
+          try { await removeInstanceFile(process.pid); } catch { /* ignore */ }
+        }
+      } catch (error) {
+        console.warn('[pi-browser-agent] graceful suspend cleanup failed', error);
+      } finally {
+        // Now actually suspend. SIGSTOP is uncatchable, so this reliably stops
+        // the process just like the default Ctrl+Z behaviour would have.
+        try { process.kill(process.pid, 'SIGSTOP'); } catch { /* ignore */ }
+      }
+    })();
+  });
+
+  process.on('SIGCONT', () => {
+    if (!suspending) return;
+    suspending = false;
+    const broker = brokerSingleton;
+    if (!broker) return;
+    void (async () => {
+      try {
+        // Re-acquire the broker on the SAME instance the session tools captured.
+        //   - primary (BrowserAgentBroker): rebinds 7878 if still free;
+        //   - remote proxy (RemoteBrowserAgentBroker): reconnects / re-promotes.
+        await broker.start();
+        if (broker instanceof BrowserAgentBroker) {
+          try {
+            await writeInstanceFile({
+              pid: process.pid,
+              port: broker.port,
+              host: broker.host,
+              url: broker.url,
+              cwd: process.cwd(),
+              startedAt: new Date().toISOString(),
+            });
+          } catch { /* ignore */ }
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (code === 'EADDRINUSE') {
+          // Another pi process became primary while we were suspended. It now
+          // owns 7878 and the bridge; this session's captured primary broker
+          // can't proxy, so browser tools here stay inactive until restart.
+          console.warn('[pi-browser-agent] another pi instance owns the broker port after resume; browser tools in this session are inactive until it is restarted');
+        } else {
+          console.warn('[pi-browser-agent] broker restart after resume failed', error);
+        }
+      }
+    })();
+  });
+}
+
 async function getOrCreateBroker(logger: BrokerLogger): Promise<BrowserAgentBrokerLike> {
   // If an existing broker is healthy, reuse it.
   if (brokerSingleton) {
@@ -206,6 +287,10 @@ export default async function piBrowserAgentExtension(pi: {
       // is not listening, so the full suite would have no working backend.
     }
   };
+
+  // Install once per process so Ctrl+Z releases the broker port instead of
+  // freezing it while still bound.
+  installSuspendResumeHandlers();
 
   pi.on('session_start', async (_event, ctx) => {
     await registerSessionTool(ctx);

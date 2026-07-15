@@ -283,6 +283,109 @@ test('remote broker promotes itself when the primary broker exits', async () => 
   await remote.stop();
 });
 
+test('with many secondaries, exactly one promotes when the primary stops and all keep working', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+
+  // Original Chrome bridge attached to the primary.
+  const firstBridge = await new Promise<WebSocket>((resolve, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+    socket.once('error', reject);
+    socket.once('open', () => socket.send(JSON.stringify({
+      v: 1, kind: 'hello', extensionId: 'ext-orig', version: '0.1.0', capabilities: ['browser_list_tabs'],
+    })));
+    socket.once('message', () => resolve(socket));
+  });
+
+  // 9 secondary pi processes, all proxying through the primary.
+  const REMOTES = 9;
+  const remotes: RemoteBrowserAgentBroker[] = [];
+  for (let i = 0; i < REMOTES; i += 1) {
+    const root = await mkdtemp(join(tmpdir(), `pi-browser-agent-elect-${i}-`));
+    const remote = new RemoteBrowserAgentBroker({
+      host: '127.0.0.1',
+      port,
+      logger: { info() {}, warn() {}, error() {} },
+      requestTimeoutMs: 2_000,
+      taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+    });
+    await remote.start();
+    assert.equal(remote.probeConnectivity().brokerListening, true);
+    remotes.push(remote);
+  }
+
+  // Primary is Ctrl+Z'd -> graceful stop releases the port + closes the bridge.
+  firstBridge.close();
+  await primary.stop();
+
+  // The 9 secondaries race to bind; exactly one wins (the OS makes bind
+  // exclusive). Wait until the port is listening again.
+  await new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + 4_000;
+    const tick = () => {
+      if (remotes.some((r) => r.probeConnectivity().url === `ws://127.0.0.1:${port}`
+          && r.probeConnectivity().brokerListening)) return resolve();
+      if (Date.now() > deadline) return reject(new Error('no secondary promoted in time'));
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+
+  // Prove single ownership: a fresh hard broker cannot bind the same port.
+  const intruder = await createBroker(port);
+  await assert.rejects(() => intruder.start(), /EADDRINUSE|address already in use/i);
+
+  // Chrome reconnects to the same stable URL; it lands on the new primary.
+  const bridge = await new Promise<WebSocket>((resolve, reject) => {
+    const deadline = Date.now() + 4_000;
+    const tryConnect = () => {
+      const candidate = new WebSocket(`ws://127.0.0.1:${port}`);
+      let settled = false;
+      candidate.once('error', () => {
+        if (settled) return; settled = true;
+        try { candidate.terminate(); } catch { /* ignore */ }
+        if (Date.now() > deadline) return reject(new Error('bridge could not reconnect'));
+        setTimeout(tryConnect, 25);
+      });
+      candidate.once('open', () => {
+        if (settled) return; settled = true;
+        candidate.send(JSON.stringify({
+          v: 1, kind: 'hello', extensionId: 'ext-new', version: '0.1.0', capabilities: ['browser_list_tabs'],
+        }));
+      });
+      candidate.once('message', () => resolve(candidate));
+    };
+    tryConnect();
+  });
+  bridge.on('message', (data: RawData) => {
+    const frame = JSON.parse(String(data));
+    if (frame.kind === 'request') {
+      bridge.send(JSON.stringify({ v: 1, kind: 'response', id: frame.id, ok: true, data: { served: true } }));
+    }
+  });
+
+  // Every one of the 9 secondaries can still drive the browser: the promoted
+  // one talks to the bridge directly, the other 8 proxy through it.
+  await new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + 2_000;
+    const tick = () => {
+      if (remotes.every((r) => r.probeConnectivity().brokerListening)) return resolve();
+      if (Date.now() > deadline) return reject(new Error('not all secondaries recovered'));
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+  const results = await Promise.all(remotes.map((r) => r.request('browser_list_tabs', {})));
+  for (const response of results) {
+    assert.equal(response.ok, true);
+    assert.equal(response.data?.served, true);
+  }
+
+  bridge.close();
+  await Promise.all(remotes.map((r) => r.stop()));
+});
+
 test('broker request/response round-trips and bridge disconnect rejects in-flight requests', async () => {
   const port = await getFreePort();
   const broker = await createBroker(port);
