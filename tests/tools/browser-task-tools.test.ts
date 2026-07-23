@@ -84,10 +84,12 @@ function textOf(result: any): string {
   return result.content[0]?.text || '';
 }
 
-test('browser_run_task happy path records history and browser_list/get_history return useful data', async () => {
+test('browser_run_task happy path targets the active tab and records useful history', async () => {
   const { broker } = await createBroker();
+  let receivedRequest: any;
   const socket = await connectBridge(broker, async (frame, ws) => {
     if (frame.type !== 'browser_run_task') return;
+    receivedRequest = frame.params;
     ws.send(JSON.stringify({
       v: 1,
       kind: 'response',
@@ -115,11 +117,14 @@ test('browser_run_task happy path records history and browser_list/get_history r
     assert.equal(runResult.details.success, true);
     assert.equal(runResult.details.status, 'done');
     assert.equal(runResult.details.historySummary.steps, 2);
+    assert.equal(receivedRequest.use_active_tab, true);
+    assert.equal(receivedRequest.tab_id, undefined);
     const taskId = String(runResult.details.taskId);
 
     const historyResult = await tools.get('browser_get_task_history').execute('call-2', { taskId });
     assert.equal(historyResult.details.ok, true);
     assert.equal(historyResult.details.history.length, 2);
+    assert.equal(historyResult.details.history[0].request.use_active_tab, true);
     assert.equal(historyResult.details.summary.status, 'done');
 
     const listResult = await tools.get('browser_list_tasks').execute('call-3', { limit: 10 });
@@ -127,6 +132,40 @@ test('browser_run_task happy path records history and browser_list/get_history r
     assert.equal(listResult.details.tasks[0].taskId, taskId);
     assert.equal(listResult.details.tasks[0].task, 'Open example.com');
     assert.equal(listResult.details.tasks[0].status, 'done');
+  } finally {
+    socket.close();
+    await broker.stop();
+  }
+});
+
+test('browser_run_task forwards an explicit tab_id instead of selecting the active tab', async () => {
+  const { broker } = await createBroker();
+  let receivedRequest: any;
+  const socket = await connectBridge(broker, async (frame, ws) => {
+    if (frame.type !== 'browser_run_task') return;
+    receivedRequest = frame.params;
+    ws.send(JSON.stringify({
+      v: 1,
+      kind: 'response',
+      id: frame.id,
+      ok: true,
+      data: { status: 'done', message: 'Used requested tab' },
+    }));
+  });
+  const tools = createToolHarness(broker);
+
+  try {
+    const result = await tools.get('browser_run_task').execute('call-1', {
+      task: 'Click the button',
+      tab_id: 374936994,
+    });
+    assert.equal(result.details.ok, true);
+    assert.equal(receivedRequest.tab_id, 374936994);
+    assert.equal(receivedRequest.use_active_tab, undefined);
+
+    const history = await tools.get('browser_get_task_history').execute('call-2', { taskId: result.details.taskId });
+    assert.equal(history.details.history[0].request.tab_id, 374936994);
+    assert.equal(history.details.history[0].request.use_active_tab, undefined);
   } finally {
     socket.close();
     await broker.stop();

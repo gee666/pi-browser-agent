@@ -282,7 +282,7 @@ export default async function piBrowserAgentExtension(pi: {
         logger,
         taskStore: new TaskStore({ dir: join(await ensureStateDir('tasks')) }),
       });
-      pi.registerTool(createBrowserAgentToolsTool(pi, fallbackBroker));
+      pi.registerTool(createBrowserAgentToolsTool(pi, fallbackBroker, { managed: false }));
       // Intentionally do NOT call registerAllTools here: the fallback broker
       // is not listening, so the full suite would have no working backend.
     }

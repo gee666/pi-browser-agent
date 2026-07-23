@@ -193,17 +193,33 @@ export function createBrowserRunTaskTool(broker: BrowserAgentBroker) {
   return {
     name: 'browser_run_task',
     label: 'browser_run_task',
-    description: 'Run a browser task end-to-end. The task might be secribed with natural English',
-    promptSnippet: 'Run a browser task.',
+    description: 'Run a browser task end-to-end. The task may be described in natural English. Defaults to the active browser tab; pass tab_id for deterministic targeting.',
+    promptSnippet: 'Run a browser task in the active or explicitly targeted tab.',
     parameters: Type.Object({
       task: Type.String({ minLength: 1 }),
+      tab_id: Type.Optional(Type.Number()),
+      use_active_tab: Type.Optional(Type.Boolean()),
       debugMode: Type.Optional(Type.Boolean()),
       timeoutMs: Type.Optional(Type.Number({ minimum: 1 })),
     }),
-    async execute(_toolCallId: string, params: { task: string; debugMode?: boolean; timeoutMs?: number }): Promise<ToolResult> {
+    async execute(
+      _toolCallId: string,
+      params: { task: string; tab_id?: number; use_active_tab?: boolean; debugMode?: boolean; timeoutMs?: number },
+    ): Promise<ToolResult> {
+      // Lazily (re)acquire the broker so a killed primary is replaced on demand.
+      await broker.ensureReady?.();
       const probe = broker.probeConnectivity();
       const taskId = randomUUID();
       const startedAt = Date.now();
+      const target = typeof params.tab_id === 'number'
+        ? { tab_id: params.tab_id }
+        : { use_active_tab: params.use_active_tab ?? true };
+      const request = {
+        taskId,
+        task: params.task,
+        debugMode: params.debugMode ?? false,
+        ...target,
+      };
 
       await appendSafe(broker, taskId, {
         kind: 'task_started',
@@ -211,14 +227,14 @@ export function createBrowserRunTaskTool(broker: BrowserAgentBroker) {
         task: params.task,
         status: 'running',
         startedAt,
-        request: { debugMode: params.debugMode ?? false, timeoutMs: params.timeoutMs },
+        request: { ...request, timeoutMs: params.timeoutMs },
       });
 
       let response: ResponseFrame;
       try {
         response = await broker.request(
           'browser_run_task',
-          { taskId, task: params.task, debugMode: params.debugMode ?? false },
+          request,
           { timeoutMs: params.timeoutMs ?? 5 * 60 * 1000 },
         );
       } catch (error) {

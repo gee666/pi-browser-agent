@@ -82,6 +82,25 @@ export class RemoteBrowserAgentBroker {
     }
   }
 
+  /** Lazily ensure a primary broker is reachable on demand. Tools call this at
+   *  the start of every request so a killed primary is replaced without waiting
+   *  for the socket-close handler: reconnect to the current primary, or (if
+   *  none is listening) compete to become the new primary. Idempotent and safe
+   *  to call concurrently — `promoteOrReconnect()` dedupes the bind race. */
+  async ensureReady(): Promise<void> {
+    if (this.promotedBroker) {
+      await this.promotedBroker.ensureReady();
+      return;
+    }
+    try {
+      await this.ensureConnected();
+      this.remoteProbe = await this.probePrimary();
+      this.startupError = null;
+    } catch {
+      await this.promoteOrReconnect();
+    }
+  }
+
   async stop(): Promise<void> {
     this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
     const socket = this.socket;

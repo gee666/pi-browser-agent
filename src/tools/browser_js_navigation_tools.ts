@@ -37,6 +37,8 @@ async function brokerToolRequest(
   timeoutMs: number,
 ): Promise<{ ok: true; data: unknown } | { ok: false; error: { code: string; message: string; details?: unknown } }> {
   try {
+    // Lazily (re)acquire the broker so a killed primary is replaced on demand.
+    await broker.ensureReady?.();
     const response = await broker.request(type, params, { timeoutMs });
     if (!response.ok) {
       return {

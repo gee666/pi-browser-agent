@@ -104,6 +104,9 @@ export async function requestBridge<TData>(
   params: unknown,
   options: { timeoutMs?: number } = {},
 ): Promise<{ response: ResponseFrame; data: TData }> {
+  // Lazily (re)acquire the broker before the readiness check so a killed
+  // primary is replaced (or reconnected to) on this request instead of failing.
+  await broker.ensureReady?.();
   ensureBridgeConnected(broker);
 
   let response: ResponseFrame;

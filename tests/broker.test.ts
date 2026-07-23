@@ -283,6 +283,41 @@ test('remote broker promotes itself when the primary broker exits', async () => 
   await remote.stop();
 });
 
+test('remote broker ensureReady() lazily promotes when the primary is gone', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-ensure-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+  assert.equal(remote.probeConnectivity().brokerListening, true);
+
+  // Primary process dies. No tool request or close handler has run yet from the
+  // caller's perspective — the next browser tool call drives recovery.
+  await primary.stop();
+
+  // ensureReady() awaits the reconnect-or-promote decision, so once it resolves
+  // the remote must own the port (it competed and won the bind race).
+  await remote.ensureReady();
+
+  const probe = remote.probeConnectivity();
+  assert.equal(probe.brokerListening, true);
+  assert.equal(probe.url, `ws://127.0.0.1:${port}`);
+
+  // A fresh hard broker must not be able to bind the same port: single owner.
+  const intruder = await createBroker(port);
+  await assert.rejects(() => intruder.start(), /EADDRINUSE|address already in use/i);
+
+  await remote.stop();
+});
+
 test('with many secondaries, exactly one promotes when the primary stops and all keep working', async () => {
   const port = await getFreePort();
   const primary = await createBroker(port);

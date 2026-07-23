@@ -141,6 +141,24 @@ export class BrowserAgentBroker {
     }
   }
 
+  /** Lazily (re)acquire the broker listener on demand. Tools call this at the
+   *  start of every request so that a process whose broker was stopped (or was
+   *  never bound, or whose primary died) competes for the port at request time
+   *  instead of failing permanently. No-op when already listening; on failure
+   *  (e.g. another process already won the port) it leaves `startupError` set so
+   *  `probeConnectivity()` reports not-listening and the caller surfaces a clear
+   *  message, while a later request can still retry. */
+  async ensureReady(): Promise<void> {
+    if (this.server) {
+      return;
+    }
+    try {
+      await this.start();
+    } catch (error) {
+      this.logger.warn?.('[pi-browser-agent] ensureReady: broker (re)start failed', error);
+    }
+  }
+
   /** Try to bind to the preferred port, walk up the configured range on
    *  EADDRINUSE, and finally fall back to an OS-assigned ephemeral port.
    *  Updates `this.port` to the actual bound port on success. */
