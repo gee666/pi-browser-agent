@@ -163,7 +163,13 @@ test('broker startup diagnostics are routed through the extension UI context', a
 
     assert.equal(getBroker(), null);
     assert.ok(notifications.some((entry) => entry.type === 'warning' && entry.message.includes('primary broker port is busy')));
-    assert.ok(notifications.some((entry) => entry.type === 'error' && entry.message.includes('Browser agent unavailable')));
+    // Startup failure is no longer fatal for the session: the user is warned,
+    // and the full browser_* suite is still registered behind a lazy handle so
+    // the integration can heal itself on a later tool call without restarting pi.
+    assert.ok(notifications.some((entry) => entry.type === 'warning' && entry.message.includes('Browser agent broker not acquired yet')));
+    assert.ok(pi.tools.has('activate_browser_agent_tools'));
+    assert.ok(pi.tools.has('browser_get_html'));
+    assert.ok(pi.tools.has('browser_run_task'));
   } finally {
     await resetForTests();
     await new Promise<void>((resolve) => blocker.close(() => resolve()));

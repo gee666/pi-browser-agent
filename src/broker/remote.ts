@@ -8,7 +8,17 @@ import {
   type ResponseFrame,
 } from './protocol.ts';
 import { TaskStore } from './task-store.ts';
-import { BrowserAgentBroker, type BrokerLogger } from './server.ts';
+import {
+  BrowserAgentBroker,
+  COLD_BRIDGE_WAIT_MS,
+  COLD_MEMO_MISS_THRESHOLD,
+  COLD_MEMO_TTL_MS,
+  DEFAULT_BRIDGE_WAIT_MS,
+  type BridgeStateEvent,
+  type BridgeStateListener,
+  type BrokerLogger,
+  type EnsureReadyOptions,
+} from './server.ts';
 
 interface PendingRequest {
   resolve: (value: ResponseFrame) => void;
@@ -40,6 +50,17 @@ export class RemoteBrowserAgentBroker {
   private remoteProbe: ProbeResult | null = null;
   private promotedBroker: BrowserAgentBroker | null = null;
   private promotionPromise: Promise<BrowserAgentBroker | null> | null = null;
+  private healTimer: ReturnType<typeof setTimeout> | null = null;
+  private healAttempt = 0;
+  private stopped = false;
+  private bridgeStateListeners = new Set<BridgeStateListener>();
+  private promotionListeners = new Set<(broker: BrowserAgentBroker) => void>();
+  private unsubscribePromoted: (() => void) | null = null;
+  /** Consecutive full-budget waits that found no bridge, plus when we gave up.
+   *  Without this every tool call on a secondary with Chrome closed burns the
+   *  whole budget again. */
+  private coldBridgeMisses = 0;
+  private coldBridgeSince: number | null = null;
 
   constructor({
     host = '127.0.0.1',
@@ -63,6 +84,11 @@ export class RemoteBrowserAgentBroker {
   }
 
   async start(): Promise<void> {
+    // start() is also the resume path after SIGTSTP called stop(). Leaving
+    // `stopped` set there disabled background healing forever, so a single
+    // Ctrl+Z left the session with no recovery path at all.
+    this.stopped = false;
+    this.healAttempt = 0;
     this.startupError = null;
     await this.taskStore.init();
     await this.taskStore.gc();
@@ -87,9 +113,9 @@ export class RemoteBrowserAgentBroker {
    *  for the socket-close handler: reconnect to the current primary, or (if
    *  none is listening) compete to become the new primary. Idempotent and safe
    *  to call concurrently — `promoteOrReconnect()` dedupes the bind race. */
-  async ensureReady(): Promise<void> {
+  async ensureReady(options: EnsureReadyOptions = {}): Promise<void> {
     if (this.promotedBroker) {
-      await this.promotedBroker.ensureReady();
+      await this.promotedBroker.ensureReady(options);
       return;
     }
     try {
@@ -97,11 +123,122 @@ export class RemoteBrowserAgentBroker {
       this.remoteProbe = await this.probePrimary();
       this.startupError = null;
     } catch {
-      await this.promoteOrReconnect();
+      const promoted = await this.promoteOrReconnect();
+      if (promoted) {
+        await promoted.ensureReady(options);
+        return;
+      }
+    }
+
+    // The primary is reachable but its Chrome bridge may be mid-reconnect.
+    // Poll the primary's probe for the same budget a local broker would wait,
+    // so a tool call arriving during a reconnect window succeeds instead of
+    // reporting a hard "connection is down".
+    await this.waitForRemoteBridge(options.waitForBridgeMs ?? this.defaultRemoteBridgeWaitMs());
+  }
+
+  /** Full budget only when the primary has actually seen a bridge at some point.
+   *  If Chrome has never connected there is nothing to wait for, and stalling
+   *  every tool call for the full budget would be pure latency. */
+  private defaultRemoteBridgeWaitMs(): number {
+    if (this.coldBridgeSince !== null && Date.now() - this.coldBridgeSince < COLD_MEMO_TTL_MS) {
+      return COLD_BRIDGE_WAIT_MS;
+    }
+    return this.remoteProbe?.bridgeEverConnected === false ? COLD_BRIDGE_WAIT_MS : DEFAULT_BRIDGE_WAIT_MS;
+  }
+
+  private async waitForRemoteBridge(timeoutMs: number): Promise<boolean> {
+    if (this.probeConnectivity().bridgeConnected) {
+      this.coldBridgeMisses = 0;
+      this.coldBridgeSince = null;
+      return true;
+    }
+    if (timeoutMs <= 0) return false;
+    const deadline = Date.now() + timeoutMs;
+    // Every sub-step below can block for up to ~1.5s, so the budget is
+    // re-checked before each of them. Checking only at the top of the loop let a
+    // final iteration overrun by several seconds, which is what turned an 8s
+    // budget into ~17s stalls on every single tool call.
+    while (Date.now() < deadline) {
+      const sleepMs = Math.min(250, deadline - Date.now());
+      if (sleepMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, sleepMs).unref?.());
+      }
+      if (this.stopped) return false;
+      if (Date.now() >= deadline) break;
+      try {
+        await this.ensureConnected();
+        if (Date.now() >= deadline) break;
+        this.remoteProbe = await this.probePrimary();
+        this.startupError = null;
+        if (this.remoteProbe.bridgeConnected) {
+          this.coldBridgeMisses = 0;
+          this.coldBridgeSince = null;
+          return true;
+        }
+      } catch {
+        if (Date.now() >= deadline) break;
+        const promoted = await this.promoteOrReconnect();
+        if (promoted) {
+          const found = await promoted.waitForBridge(Math.max(0, deadline - Date.now()));
+          this.recordBridgeWaitOutcome(found, timeoutMs);
+          return found;
+        }
+      }
+    }
+    const connected = this.probeConnectivity().bridgeConnected;
+    this.recordBridgeWaitOutcome(connected, timeoutMs);
+    return connected;
+  }
+
+  /** Remember that a full budget was spent without ever seeing a bridge, so the
+   *  next calls fail fast on a short budget instead of stalling the agent for
+   *  the full window on every request while Chrome is closed. */
+  private recordBridgeWaitOutcome(connected: boolean, budget: number): void {
+    if (connected) {
+      this.coldBridgeMisses = 0;
+      this.coldBridgeSince = null;
+      return;
+    }
+    if (budget < DEFAULT_BRIDGE_WAIT_MS) return;
+    this.coldBridgeMisses += 1;
+    if (this.coldBridgeMisses >= COLD_MEMO_MISS_THRESHOLD) {
+      this.coldBridgeSince = Date.now();
+    }
+  }
+
+  /** Subscribe to bridge connect/disconnect transitions, whether they come from
+   *  a broker we promoted ourselves or from a `notify` push by the primary. */
+  addBridgeStateListener(listener: BridgeStateListener): () => void {
+    this.bridgeStateListeners.add(listener);
+    return () => {
+      this.bridgeStateListeners.delete(listener);
+    };
+  }
+
+  /** Fired when this secondary wins the bind race and becomes the primary, so
+   *  the host process can republish instance discovery (which would otherwise
+   *  keep pointing at the dead primary). */
+  addPromotionListener(listener: (broker: BrowserAgentBroker) => void): () => void {
+    this.promotionListeners.add(listener);
+    return () => {
+      this.promotionListeners.delete(listener);
+    };
+  }
+
+  private emitBridgeState(state: BridgeStateEvent): void {
+    for (const listener of [...this.bridgeStateListeners]) {
+      try {
+        listener(state);
+      } catch (error) {
+        this.logger.warn?.('[pi-browser-agent] bridge state listener failed', error);
+      }
     }
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
+    this.cancelHealTimer();
     this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
     const socket = this.socket;
     this.socket = null;
@@ -109,6 +246,10 @@ export class RemoteBrowserAgentBroker {
     if (socket) {
       try { socket.close(); } catch { /* ignore */ }
     }
+    this.unsubscribePromoted?.();
+    this.unsubscribePromoted = null;
+    this.bridgeStateListeners.clear();
+    this.promotionListeners.clear();
     if (this.promotedBroker) {
       const broker = this.promotedBroker;
       this.promotedBroker = null;
@@ -159,16 +300,23 @@ export class RemoteBrowserAgentBroker {
 
   probeConnectivity(): ProbeResult {
     if (this.promotedBroker) {
-      return this.promotedBroker.probeConnectivity();
+      return { ...this.promotedBroker.probeConnectivity(), role: 'promoted' };
     }
     const primary = this.remoteProbe;
     if (primary) {
+      // A cached snapshot must never claim a live broker/bridge once our own
+      // socket to the primary is gone; otherwise tools happily send requests
+      // into a dead proxy and only fail on timeout, and callers cannot tell
+      // "healed" from "still using a stale snapshot".
+      const proxyAlive = !!this.socket && !this.startupError;
       return {
         ...primary,
-        brokerReachable: !this.startupError && primary.brokerReachable,
-        brokerListening: !this.startupError && primary.brokerListening,
+        brokerReachable: proxyAlive && primary.brokerReachable,
+        brokerListening: proxyAlive && primary.brokerListening,
+        bridgeConnected: proxyAlive && primary.bridgeConnected,
         startupError: this.startupError?.message || primary.startupError,
         url: this.url,
+        role: 'proxy',
       };
     }
     return {
@@ -178,6 +326,7 @@ export class RemoteBrowserAgentBroker {
       startupError: this.startupError?.message,
       url: this.url,
       bridgeSessionSerial: 0,
+      role: 'proxy',
     };
   }
 
@@ -211,6 +360,7 @@ export class RemoteBrowserAgentBroker {
         this.pendingRequests.delete(id);
         reject(new Error(`Port ${this.port} is busy, but it is not a pi-browser-agent broker`));
       }, Math.min(this.requestTimeoutMs, 1500));
+      timeout.unref?.();
       this.pendingRequests.set(id, { resolve, reject, timeout });
     });
   }
@@ -219,8 +369,18 @@ export class RemoteBrowserAgentBroker {
     if (this.socket?.readyState === WebSocket.OPEN) return;
     if (this.connectPromise) return await this.connectPromise;
 
-    this.connectPromise = new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(this.url);
+    // Construct the socket OUTSIDE the promise: a synchronous throw from the
+    // WebSocket constructor used to be captured into `connectPromise` after the
+    // executor's own `this.connectPromise = null` had already run, permanently
+    // caching a rejected promise so every later ensureConnected() failed.
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(this.url);
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+
+    const pending = new Promise<void>((resolve, reject) => {
       let settled = false;
       const connectTimeout = setTimeout(() => {
         fail(new Error(`Port ${this.port} is busy, but it is not a pi-browser-agent broker`));
@@ -247,7 +407,7 @@ export class RemoteBrowserAgentBroker {
           if (this.socket === socket) {
             this.socket = null;
             this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
-            void this.promoteOrReconnect();
+            void this.healInBackground('primary broker socket closed');
           }
         });
         socket.on('error', (error) => {
@@ -255,7 +415,7 @@ export class RemoteBrowserAgentBroker {
           if (this.socket === socket) {
             this.socket = null;
             this.rejectPendingRequests(error instanceof Error ? error : new Error(String(error)));
-            void this.promoteOrReconnect();
+            void this.healInBackground('primary broker socket error');
           }
         });
         resolve();
@@ -264,7 +424,54 @@ export class RemoteBrowserAgentBroker {
       socket.once('unexpected-response', () => fail(new Error(`Port ${this.port} is busy, but it is not a pi-browser-agent broker`)));
     });
 
+    // Belt and braces: never leave a rejected promise cached, whatever path the
+    // failure took.
+    this.connectPromise = pending.catch((error) => {
+      this.connectPromise = null;
+      throw error;
+    });
+
     return await this.connectPromise;
+  }
+
+  /**
+   * Keep trying to reattach to (or become) a primary broker in the background.
+   *
+   * Without this, recovery only ever happened when an agent made a tool call:
+   * if the primary pi process died at 3am, every secondary sat disconnected
+   * until someone poked it, and the Chrome extension had no listener at all to
+   * reconnect to. The retry loop closes that hole so the port is re-owned within
+   * seconds of the primary disappearing, whether or not anyone is asking.
+   */
+  private async healInBackground(reason: string): Promise<void> {
+    if (this.stopped) return;
+    this.logger.warn?.('[pi-browser-agent] lost primary broker; healing', { reason });
+    const promoted = await this.promoteOrReconnect();
+    if (promoted || this.socket) {
+      this.healAttempt = 0;
+      this.cancelHealTimer();
+      return;
+    }
+    this.scheduleHeal();
+  }
+
+  private scheduleHeal(): void {
+    if (this.stopped || this.healTimer) return;
+    const delays = [500, 1_000, 2_000, 3_000, 5_000];
+    const delay = delays[Math.min(this.healAttempt, delays.length - 1)];
+    this.healAttempt += 1;
+    this.healTimer = setTimeout(() => {
+      this.healTimer = null;
+      void this.healInBackground('scheduled reconnect retry');
+    }, delay);
+    this.healTimer.unref?.();
+  }
+
+  private cancelHealTimer(): void {
+    if (this.healTimer) {
+      clearTimeout(this.healTimer);
+      this.healTimer = null;
+    }
   }
 
   private async promoteOrReconnect(): Promise<BrowserAgentBroker | null> {
@@ -285,10 +492,21 @@ export class RemoteBrowserAgentBroker {
       });
       try {
         await candidate.start();
+        this.unsubscribePromoted?.();
+        this.unsubscribePromoted = candidate.addBridgeStateListener((state) => this.emitBridgeState(state));
         this.promotedBroker = candidate;
         this.remoteProbe = candidate.probeConnectivity();
         this.startupError = null;
+        this.healAttempt = 0;
+        this.cancelHealTimer();
         this.logger.info?.('[pi-browser-agent] promoted secondary broker to primary', { url: candidate.url });
+        for (const listener of [...this.promotionListeners]) {
+          try {
+            listener(candidate);
+          } catch (error) {
+            this.logger.warn?.('[pi-browser-agent] promotion listener failed', error);
+          }
+        }
         return candidate;
       } catch (error) {
         const code = (error as NodeJS.ErrnoException)?.code;
@@ -322,6 +540,23 @@ export class RemoteBrowserAgentBroker {
       this.logger.warn?.('[pi-browser-agent] invalid primary proxy frame', error);
       return;
     }
+    // The primary pushes bridge transitions instead of making us poll, so a
+    // secondary session can tell its user the browser went away.
+    if (frame.kind === 'notify') {
+      if (frame.event !== 'bridge_state') return;
+      const payload = frame.payload as Partial<ProbeResult> | undefined;
+      if (payload && typeof payload === 'object') {
+        this.remoteProbe = { ...(this.remoteProbe ?? {} as ProbeResult), ...payload };
+      }
+      const probe = this.probeConnectivity();
+      if (probe.bridgeConnected) {
+        this.coldBridgeMisses = 0;
+        this.coldBridgeSince = null;
+      }
+      this.emitBridgeState({ connected: probe.bridgeConnected, probe });
+      return;
+    }
+
     if (frame.kind !== 'response') return;
     const pending = this.pendingRequests.get(frame.id);
     if (!pending) return;

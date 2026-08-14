@@ -23,8 +23,22 @@ function textOf(result: any): string {
   return result.content[0]?.text || '';
 }
 
-function createBrokerStub(handler: (type: string, params: unknown, options: { timeoutMs?: number }) => Promise<ResponseFrame>) {
+function createBrokerStub(
+  handler: (type: string, params: unknown, options: { timeoutMs?: number }) => Promise<ResponseFrame>,
+  probeOverrides: Record<string, unknown> = {},
+) {
   return {
+    async ensureReady() {},
+    probeConnectivity() {
+      return {
+        brokerReachable: true,
+        brokerListening: true,
+        bridgeConnected: true,
+        url: 'ws://127.0.0.1:7878',
+        bridgeSessionSerial: 1,
+        ...probeOverrides,
+      };
+    },
     async request(type: string, params: unknown, options: { timeoutMs?: number }) {
       return await handler(type, params, options);
     },

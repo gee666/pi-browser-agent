@@ -1,24 +1,13 @@
 import { Type } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
+import { formatBridgeFailure } from '../broker/diagnostics.ts';
 import { getPlaceholderBrowserToolSpecs } from './_register.ts';
 
 export function resetBrowserAgentToolState(): void {
   // No-op retained for API compatibility. Browser tool registration is now
   // performed eagerly at session_start in src/index.ts, so the meta-tool no
   // longer owns any first-call registration state.
-}
-
-function buildFailureMessage(reason: string, probe: ReturnType<BrowserAgentBroker['probeConnectivity']>): string {
-  return [
-    `Browser integration is not available. Reason: ${reason}.`,
-    '',
-    'To fix:',
-    `  1. Make sure the pi-browser-agent broker is running on ${probe.url || 'ws://127.0.0.1:7878'}.`,
-    '  2. Load or reload the browser-agent-ext Chrome extension.',
-    '  3. In the extension options, enable the pi bridge and point it at the broker URL.',
-    '  4. Retry activate_browser_agent_tools after the broker and bridge are healthy.',
-  ].join('\n');
 }
 
 function buildSuccessMessage(probe: ReturnType<BrowserAgentBroker['probeConnectivity']>): string {
@@ -30,8 +19,15 @@ function buildSuccessMessage(probe: ReturnType<BrowserAgentBroker['probeConnecti
     ...getPlaceholderBrowserToolSpecs().map((tool) => `- ${tool.name} — ${tool.description}`),
   ];
 
-  if (probe.bridgeVersion) {
-    lines.push('', `Bridge version: ${probe.bridgeVersion}`);
+  const health: string[] = [];
+  if (probe.bridgeVersion) health.push(`bridge version ${probe.bridgeVersion}`);
+  if (probe.role) health.push(`broker role ${probe.role}`);
+  if (probe.url) health.push(`broker ${probe.url}`);
+  if (probe.lastBridgeDisconnectedAt) {
+    health.push(`last bridge drop ${probe.lastBridgeDisconnectedAt}${probe.lastBridgeDisconnectReason ? ` (${probe.lastBridgeDisconnectReason})` : ''}`);
+  }
+  if (health.length > 0) {
+    lines.push('', `Health: ${health.join('; ')}.`);
   }
 
   return lines.join('\n');
@@ -46,8 +42,8 @@ export function createBrowserAgentToolsTool(
     name: 'activate_browser_agent_tools',
     label: 'Activate Browser Agent Tools',
     description:
-      'Self-check for the browser integration. The browser_* tool suite is registered at session start; this tool reports current broker/bridge status.',
-    promptSnippet: 'Check the browser integration status for this session.',
+      'Diagnose and repair the browser integration. Forces a lazy re-acquire of the broker port (promoting this pi process to primary if the previous owner died) and waits for the Chrome extension bridge to reconnect. Call this whenever a browser_* tool reports E_BRIDGE_DISCONNECTED; it returns the full connectivity state plus recovery steps.',
+    promptSnippet: 'Diagnose and repair the browser integration for this session.',
     parameters: Type.Object({}),
     async execute(_toolCallId: string, _params: Record<string, unknown>) {
       // Lazily (re)acquire the broker so a killed primary is replaced on demand
@@ -58,17 +54,11 @@ export function createBrowserAgentToolsTool(
         await broker.ensureReady?.();
       }
       const probe = broker.probeConnectivity();
-      if (!probe.brokerReachable || !probe.brokerListening) {
+      if (!probe.brokerReachable || !probe.brokerListening || !probe.bridgeConnected) {
+        const { text, diagnostics } = formatBridgeFailure(probe, 'activate_browser_agent_tools');
         return {
-          content: [{ type: 'text', text: buildFailureMessage(probe.startupError || 'broker is not listening', probe) }],
-          details: { probe },
-        };
-      }
-
-      if (!probe.bridgeConnected) {
-        return {
-          content: [{ type: 'text', text: buildFailureMessage('Chrome extension bridge is not connected', probe) }],
-          details: { probe },
+          content: [{ type: 'text', text }],
+          details: { ok: false, probe, diagnostics },
         };
       }
 

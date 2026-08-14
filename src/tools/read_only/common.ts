@@ -8,6 +8,7 @@ import type { TSchema } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../../broker/server.ts';
 import type { ResponseFrame } from '../../broker/protocol.ts';
+import { formatBridgeFailure } from '../../broker/diagnostics.ts';
 import { truncateAndSpill } from '../../util/truncate.ts';
 
 const SCREENSHOT_TEMP_DIR = join(tmpdir(), 'pi-browser-agent', 'screenshots');
@@ -88,14 +89,15 @@ export function coerceError(error: unknown, fallbackCode = 'E_INTERNAL'): Browse
   return new BrowserReadOnlyToolError(normalizedCode, message);
 }
 
-export function ensureBridgeConnected(broker: BrowserAgentBroker): void {
+export function ensureBridgeConnected(broker: BrowserAgentBroker, toolName?: string): void {
   const probe = broker.probeConnectivity();
-  if (!probe.brokerListening) {
-    throw new BrowserReadOnlyToolError('E_BRIDGE_DISCONNECTED', `Browser agent broker is not listening at ${probe.url}.`, probe);
+  if (probe.brokerListening && probe.bridgeConnected) {
+    return;
   }
-  if (!probe.bridgeConnected) {
-    throw new BrowserReadOnlyToolError('E_BRIDGE_DISCONNECTED', 'Browser agent bridge is not connected.', probe);
-  }
+  // Never surface a bare "connection is down": hand the agent the full state
+  // plus an ordered list of recovery actions it can perform on its own.
+  const { text, diagnostics } = formatBridgeFailure(probe, toolName);
+  throw new BrowserReadOnlyToolError('E_BRIDGE_DISCONNECTED', text, { probe, diagnostics });
 }
 
 export async function requestBridge<TData>(
@@ -106,8 +108,10 @@ export async function requestBridge<TData>(
 ): Promise<{ response: ResponseFrame; data: TData }> {
   // Lazily (re)acquire the broker before the readiness check so a killed
   // primary is replaced (or reconnected to) on this request instead of failing.
+  // ensureReady() also absorbs the extension's reconnect window, so a call that
+  // lands mid-reconnect waits instead of failing.
   await broker.ensureReady?.();
-  ensureBridgeConnected(broker);
+  ensureBridgeConnected(broker, type);
 
   let response: ResponseFrame;
   try {

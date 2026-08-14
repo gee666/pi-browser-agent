@@ -5,6 +5,7 @@ import { RemoteBrowserAgentBroker } from './broker/remote.ts';
 import { TaskStore } from './broker/task-store.ts';
 import { ensureStateDir } from './util/paths.ts';
 import { listInstances, removeInstanceFile, writeInstanceFile } from './util/instances.ts';
+import { LazyBrokerHandle, type BrokerLike } from './broker/lazy.ts';
 import { registerAllTools, resetRegisteredBrowserTools } from './tools/_register.ts';
 import { createBrowserAgentToolsTool, resetBrowserAgentToolState } from './tools/browser_agent_tools.ts';
 
@@ -18,6 +19,11 @@ type ExtensionContextLike = { ui?: ExtensionUi };
 let brokerSingleton: BrowserAgentBrokerLike | null = null;
 let brokerStartup: Promise<BrowserAgentBrokerLike> | null = null;
 let startupMessage: string | null = null;
+/** Handles handed to the browser_* tools. They outlive the broker, so shutdown
+ *  has to disarm them explicitly or a late tool call re-binds the port. */
+const activeHandles = new Set<LazyBrokerHandle>();
+/** Per-session teardown (bridge-state / promotion subscriptions). */
+const sessionCleanups = new Set<() => void>();
 
 export function getBroker(): BrowserAgentBrokerLike | null {
   return brokerSingleton;
@@ -35,6 +41,14 @@ export async function resetForTests(): Promise<void> {
       // ignore in tests; callers are resetting state intentionally
     }
   }
+  for (const cleanup of [...sessionCleanups]) {
+    try { cleanup(); } catch { /* ignore */ }
+  }
+  sessionCleanups.clear();
+  for (const handle of [...activeHandles]) {
+    handle.dispose();
+  }
+  activeHandles.clear();
   brokerSingleton = null;
   brokerStartup = null;
   startupMessage = null;
@@ -207,15 +221,63 @@ function installSuspendResumeHandlers(): void {
       } catch (error) {
         const code = (error as NodeJS.ErrnoException)?.code;
         if (code === 'EADDRINUSE') {
-          // Another pi process became primary while we were suspended. It now
-          // owns 7878 and the bridge; this session's captured primary broker
-          // can't proxy, so browser tools here stay inactive until restart.
-          console.warn('[pi-browser-agent] another pi instance owns the broker port after resume; browser tools in this session are inactive until it is restarted');
+          // Another pi process became primary while we were suspended. That is
+          // fine: the lazy handle re-resolves this session into a proxy of the
+          // new primary on the next tool call, so no restart is needed.
+          console.warn('[pi-browser-agent] another pi instance owns the broker port after resume; this session re-resolves into a proxy of the new primary automatically');
         } else {
           console.warn('[pi-browser-agent] broker restart after resume failed', error);
         }
       }
     })();
+  });
+}
+
+/**
+ * Surface bridge health to the human running pi.
+ *
+ * The failure mode this guards against: the broker keeps listening, Chrome keeps
+ * running, but the extension's service worker socket is gone — so every agent
+ * reports "the connection is down" while the user sees nothing wrong. Now the
+ * transition is announced in the UI the moment it happens.
+ */
+function attachBridgeStateReporter(broker: BrowserAgentBrokerLike, ctx?: ExtensionContextLike): () => void {
+  const notify = ctx?.ui?.notify;
+  const setStatus = ctx?.ui?.setStatus;
+  // Per-subscription, not per-process: with a module global one session's
+  // transition suppressed every other session's notification.
+  let lastReportedBridgeState: boolean | null = null;
+  return broker.addBridgeStateListener(({ connected, probe }) => {
+    if (lastReportedBridgeState === connected) return;
+    lastReportedBridgeState = connected;
+    setStatus?.('browser-bridge', connected ? 'browser: connected' : 'browser: DISCONNECTED');
+    if (connected) {
+      notify?.(`Browser extension bridge reconnected (${probe.url || 'ws://127.0.0.1:7878'}).`, 'info');
+    } else {
+      notify?.(
+        `Browser extension bridge disconnected${probe.lastBridgeDisconnectReason ? `: ${probe.lastBridgeDisconnectReason}` : ''}. `
+        + 'pi keeps retrying automatically; if browser tools stay unavailable, reload the "Browser Agent" extension at chrome://extensions.',
+        'warning',
+      );
+    }
+  });
+}
+
+/** Republish instance discovery when a secondary wins the bind race. Without
+ *  this, discovery keeps advertising the dead primary's pid/port forever. */
+function attachPromotionReporter(broker: BrowserAgentBrokerLike, logger: BrokerLogger): () => void {
+  if (!(broker instanceof RemoteBrowserAgentBroker)) return () => {};
+  return broker.addPromotionListener((promoted) => {
+    void writeInstanceFile({
+      pid: process.pid,
+      port: promoted.port,
+      host: promoted.host,
+      url: promoted.url,
+      cwd: process.cwd(),
+      startedAt: new Date().toISOString(),
+    }).catch((error) => {
+      logger.warn?.('[pi-browser-agent] failed to publish instance discovery file after promotion', error);
+    });
   });
 }
 
@@ -226,8 +288,12 @@ async function getOrCreateBroker(logger: BrokerLogger): Promise<BrowserAgentBrok
     if (probe.brokerListening) {
       return brokerSingleton;
     }
-    // Non-listening singleton (e.g. after a prior failure). Drop it and retry.
+    // Non-listening singleton (e.g. after a prior failure). Stop it before
+    // dropping the reference: an abandoned broker keeps its heal timers and can
+    // still bind the port, giving this process two competing brokers.
+    const stale = brokerSingleton;
     brokerSingleton = null;
+    void stale.stop().catch(() => {});
   }
 
   // Serialize startup: at most one in-flight start attempt at a time.
@@ -259,32 +325,60 @@ export default async function piBrowserAgentExtension(pi: {
     resetRegisteredBrowserTools();
     const logger = createUiLogger(ctx);
 
+    // One subscription per (session, broker instance). Re-resolving the broker
+    // must not stack duplicate reporters, and the previous broker's must go.
+    let attachedBroker: BrowserAgentBrokerLike | null = null;
+    let detachReporters: (() => void) | null = null;
+    const attachReporters = (broker: BrowserAgentBrokerLike) => {
+      if (attachedBroker === broker) return;
+      detachReporters?.();
+      const detachBridge = attachBridgeStateReporter(broker, ctx);
+      const detachPromotion = attachPromotionReporter(broker, logger);
+      detachReporters = () => {
+        detachBridge();
+        detachPromotion();
+      };
+      attachedBroker = broker;
+    };
+
+    // pi reads the tool registry once at session_start; any later
+    // registerTool() call is dropped. So we ALWAYS register the full browser_*
+    // suite, backed by a lazy handle that re-acquires the broker on every tool
+    // call. That way a session started while Chrome/the broker was down still
+    // gets working tools the moment the browser comes back, with no restart.
+    // The handle's task store is used directly by the task tools, so it must be
+    // initialised here — it is a different instance from the broker's.
+    const taskStore = new TaskStore({ dir: join(await ensureStateDir('tasks')) });
+    await taskStore.init();
+    const handle = new LazyBrokerHandle(async () => {
+      const broker = await getOrCreateBroker(logger);
+      attachReporters(broker);
+      return broker as unknown as BrokerLike;
+    }, taskStore);
+    activeHandles.add(handle);
+    sessionCleanups.add(() => {
+      detachReporters?.();
+      detachReporters = null;
+      attachedBroker = null;
+    });
+
+    pi.registerTool(createBrowserAgentToolsTool(pi, handle as any));
+    registerAllTools(pi, { broker: handle as any });
+
+    // Best-effort eager acquisition so the session starts out connected and the
+    // user sees the real state immediately. Failure here is not fatal anymore:
+    // the lazy handle retries on every subsequent tool call.
     try {
       const broker = await getOrCreateBroker(logger);
+      attachReporters(broker);
+      handle.adopt(broker as unknown as BrokerLike);
       startupMessage = null;
-      pi.registerTool(createBrowserAgentToolsTool(pi, broker));
-      // pi reads the tool registry at session_start; any later registerTool()
-      // calls (e.g. from a meta-tool invocation) are dropped. Register the
-      // full browser_* suite eagerly whenever the broker is listening. The
-      // tools themselves probe the bridge at call time and return structured
-      // errors if the Chrome extension bridge is disconnected.
-      const probe = broker.probeConnectivity();
-      if (probe.brokerListening) {
-        registerAllTools(pi, { broker });
-      }
     } catch (error) {
       startupMessage = error instanceof Error ? error.message : String(error);
-      ctx?.ui?.notify?.(`Browser agent unavailable: ${startupMessage}`, 'error');
-      // Install the meta-tool against a non-started fallback broker so the
-      // session still exposes a diagnostic surface. Do NOT publish this broker
-      // as the singleton — we want a real bind retry on the next session.
-      const fallbackBroker = new BrowserAgentBroker({
-        logger,
-        taskStore: new TaskStore({ dir: join(await ensureStateDir('tasks')) }),
-      });
-      pi.registerTool(createBrowserAgentToolsTool(pi, fallbackBroker, { managed: false }));
-      // Intentionally do NOT call registerAllTools here: the fallback broker
-      // is not listening, so the full suite would have no working backend.
+      ctx?.ui?.notify?.(
+        `Browser agent broker not acquired yet: ${startupMessage}. Browser tools are registered and will retry automatically.`,
+        'warning',
+      );
     }
   };
 
@@ -298,6 +392,16 @@ export default async function piBrowserAgentExtension(pi: {
 
   pi.on('session_shutdown', async (_event, ctx) => {
     brokerStartup = null;
+    for (const cleanup of [...sessionCleanups]) {
+      try { cleanup(); } catch { /* ignore */ }
+    }
+    sessionCleanups.clear();
+    // Disarm the tool-facing handles first: they still point at the broker we
+    // are about to stop, and ensureReady() would happily re-bind the port.
+    for (const handle of [...activeHandles]) {
+      handle.dispose();
+    }
+    activeHandles.clear();
     if (!brokerSingleton) {
       startupMessage = null;
       return;

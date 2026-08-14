@@ -37,7 +37,16 @@ test('meta-tool reports broker-offline status accurately and does not register a
   } as any);
 
   const result = await tool.execute('call-1', {});
-  assert.match(textOf(result), /not available/i);
+  const text = textOf(result);
+  assert.match(text, /E_BRIDGE_DISCONNECTED/);
+  assert.match(text, /could not be reached/i);
+  assert.match(text, /port busy/);
+  // The failure report must be self-service actionable, not a dead end.
+  assert.match(text, /Self-service recovery/i);
+  assert.match(text, /activate_browser_agent_tools/);
+  assert.match(text, /TELL THE USER/i);
+  assert.equal((result.details as any).diagnostics.kind, 'broker_unreachable');
+  assert.ok(Array.isArray((result.details as any).diagnostics.remediation));
   assert.equal(tool.name, 'activate_browser_agent_tools');
   assert.doesNotMatch(tool.description, /browser_run_task|browser_get_html|browser_get_network/i);
   // The meta-tool never registers tools; registration happens at session_start.
@@ -60,7 +69,10 @@ test('meta-tool reports bridge-absent status accurately; registration is the ses
   } as any);
 
   const result = await tool.execute('call-1', {});
-  assert.match(textOf(result), /bridge is not connected/i);
+  const text = textOf(result);
+  assert.match(text, /Chrome extension bridge has never connected/i);
+  assert.match(text, /Self-service recovery/i);
+  assert.equal((result.details as any).diagnostics.kind, 'bridge_never_connected');
   // Broker listening alone is now enough for session_start to register the
   // suite, because tools return structured errors when the bridge is absent.
   // The meta-tool itself never registers tools.
@@ -82,6 +94,8 @@ test('meta-tool reports ready status when broker + bridge are healthy and remain
         bridgeVersion: '0.1.0',
         capabilities: ['probe'],
         url: 'ws://127.0.0.1:7878',
+        bridgeEverConnected: true,
+        role: 'primary' as const,
       };
     },
   } as any);

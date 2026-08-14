@@ -4,6 +4,7 @@ import { Type } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import type { ResponseFrame } from '../broker/protocol.ts';
+import { formatBridgeFailure } from '../broker/diagnostics.ts';
 import { assertValidTaskId, TaskCorruptionError, type TaskStoreEntry } from '../broker/task-store.ts';
 
 interface ToolResult {
@@ -206,9 +207,24 @@ export function createBrowserRunTaskTool(broker: BrowserAgentBroker) {
       _toolCallId: string,
       params: { task: string; tab_id?: number; use_active_tab?: boolean; debugMode?: boolean; timeoutMs?: number },
     ): Promise<ToolResult> {
-      // Lazily (re)acquire the broker so a killed primary is replaced on demand.
+      // Lazily (re)acquire the broker so a killed primary is replaced on demand,
+      // and wait out the extension's reconnect window before deciding we are down.
       await broker.ensureReady?.();
       const probe = broker.probeConnectivity();
+
+      // Fail fast with actionable diagnostics rather than recording a task that
+      // can never run and timing out five minutes later.
+      if (!probe.brokerListening || !probe.bridgeConnected) {
+        const { text, diagnostics } = formatBridgeFailure(probe, 'browser_run_task');
+        return textResult(text, {
+          ok: false,
+          success: false,
+          status: 'error',
+          error: { code: 'E_BRIDGE_DISCONNECTED', message: text, details: { probe, diagnostics } },
+          probe,
+        });
+      }
+
       const taskId = randomUUID();
       const startedAt = Date.now();
       const target = typeof params.tab_id === 'number'

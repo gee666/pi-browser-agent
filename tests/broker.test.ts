@@ -9,6 +9,7 @@ import WebSocket, { WebSocketServer, type RawData } from 'ws';
 
 import { BrowserAgentBroker } from '../src/broker/server.ts';
 import { RemoteBrowserAgentBroker } from '../src/broker/remote.ts';
+import { LazyBrokerHandle } from '../src/broker/lazy.ts';
 import { TaskStore } from '../src/broker/task-store.ts';
 
 async function getFreePort(): Promise<number> {
@@ -30,6 +31,32 @@ async function getFreePort(): Promise<number> {
       });
     });
   });
+}
+
+/**
+ * A plain TCP server used to squat a port.
+ *
+ * It MUST destroy the connections it accepts on close: a `ws` client aborted
+ * while still in CONNECTING does not FIN the peer, so an accepting-but-silent
+ * server keeps the accepted socket (and the whole test process) alive forever.
+ */
+async function startPortBlocker(port: number): Promise<{ close: () => Promise<void> }> {
+  const accepted: net.Socket[] = [];
+  const server = net.createServer((socket) => {
+    accepted.push(socket);
+    socket.on('error', () => {});
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.listen(port, '127.0.0.1', () => resolve()).once('error', reject);
+  });
+  return {
+    close: async () => {
+      for (const socket of accepted) {
+        try { socket.destroy(); } catch { /* ignore */ }
+      }
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    },
+  };
 }
 
 async function createBroker(port: number, opts: { portRange?: number; fallbackToEphemeral?: boolean } = {}) {
@@ -152,7 +179,7 @@ test('remote broker rejects a busy primary port that is not pi-browser-agent', a
 
   await assert.rejects(() => remote.start(), /not a pi-browser-agent broker/i);
   await remote.stop();
-  await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
+  await blocker.close();
 });
 
 test('remote broker rejects an old pi-browser-agent primary without proxy support', async () => {
@@ -570,8 +597,7 @@ test('request rejects immediately with E_BRIDGE_DISCONNECTED if the bridge was e
 
 test('broker throws on startup failure and does not publish a non-listening server (range=1, no ephemeral)', async () => {
   const port = await getFreePort();
-  const blocker = net.createServer();
-  await new Promise<void>((resolve, reject) => blocker.listen(port, '127.0.0.1', () => resolve()).once('error', reject));
+  const blocker = await startPortBlocker(port);
 
   const broker = await createBroker(port, { portRange: 1, fallbackToEphemeral: false });
   await assert.rejects(() => broker.start(), /EADDRINUSE|address already in use/i);
@@ -582,13 +608,12 @@ test('broker throws on startup failure and does not publish a non-listening serv
   assert.match(probe.startupError || '', /EADDRINUSE|address already in use/i);
 
   await broker.stop();
-  await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
+  await blocker.close();
 });
 
 test('broker walks port range past a busy preferred port and publishes the actual bound port', async () => {
   const preferred = await getFreePort();
-  const blocker = net.createServer();
-  await new Promise<void>((resolve, reject) => blocker.listen(preferred, '127.0.0.1', () => resolve()).once('error', reject));
+  const blocker = await startPortBlocker(preferred);
 
   const broker = await createBroker(preferred, { portRange: 5, fallbackToEphemeral: false });
   await broker.start();
@@ -599,7 +624,7 @@ test('broker walks port range past a busy preferred port and publishes the actua
   assert.equal(broker.url, `ws://127.0.0.1:${broker.port}`);
 
   await broker.stop();
-  await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
+  await blocker.close();
 });
 
 test('two brokers can run concurrently with default port range without EADDRINUSE', async () => {
@@ -624,8 +649,7 @@ test('two brokers can run concurrently with default port range without EADDRINUS
 
 test('broker falls back to an ephemeral port when the entire range is busy', async () => {
   const preferred = await getFreePort();
-  const blocker = net.createServer();
-  await new Promise<void>((resolve, reject) => blocker.listen(preferred, '127.0.0.1', () => resolve()).once('error', reject));
+  const blocker = await startPortBlocker(preferred);
 
   // portRange=1 means only `preferred` itself is tried before fallback.
   const broker = await createBroker(preferred, { portRange: 1, fallbackToEphemeral: true });
@@ -636,5 +660,323 @@ test('broker falls back to an ephemeral port when the entire range is busy', asy
   assert.ok(broker.port > 0);
 
   await broker.stop();
-  await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
+  await blocker.close();
 });
+
+// ─── Self-healing / diagnostics regressions ─────────────────────────────────
+// These cover the failure that left long-lived pi instances permanently unable
+// to reach a running Chrome: nothing re-established the bridge, and the error
+// the agent saw was a bare "connection is down".
+
+test('ensureReady() waits out an in-flight bridge reconnect instead of failing', async () => {
+  const port = await getFreePort();
+  const broker = await createBroker(port);
+  await broker.start();
+
+  // First bridge connects, then drops — mirroring a service-worker teardown.
+  const first = await connectBridge(port, 'ext-flap-1');
+  await waitFor(() => broker.probeConnectivity().bridgeConnected, 1_000, 'first bridge connect');
+  first.close();
+  await waitFor(() => !broker.probeConnectivity().bridgeConnected, 1_000, 'first bridge drop');
+
+  const probeAfterDrop = broker.probeConnectivity();
+  assert.equal(probeAfterDrop.bridgeEverConnected, true);
+  assert.ok(probeAfterDrop.lastBridgeDisconnectedAt);
+  assert.match(String(probeAfterDrop.lastBridgeDisconnectReason), /closed|error/i);
+
+  // The extension reconnects 200ms later. ensureReady() must absorb that window.
+  const late: { second?: WebSocket } = {};
+  setTimeout(() => { void connectBridge(port, 'ext-flap-2').then((socket) => { late.second = socket; }); }, 200);
+
+  await broker.ensureReady({ waitForBridgeMs: 3_000 });
+  assert.equal(broker.probeConnectivity().bridgeConnected, true);
+
+  late.second?.close();
+  await broker.stop();
+});
+
+test('ensureReady() rebinds a listener that was closed underneath the broker', async () => {
+  const port = await getFreePort();
+  const broker = await createBroker(port);
+  await broker.start();
+  assert.equal(broker.probeConnectivity().brokerListening, true);
+
+  await broker.stop();
+  assert.equal(broker.probeConnectivity().brokerListening, false);
+
+  // A later tool call must transparently re-acquire the port.
+  await broker.ensureReady({ waitForBridgeMs: 0 });
+  assert.equal(broker.probeConnectivity().brokerListening, true);
+  assert.equal(broker.port, port);
+
+  await broker.stop();
+});
+
+test('bridge state transitions are reported so the user is told what happened', async () => {
+  const port = await getFreePort();
+  const broker = await createBroker(port);
+  const events: boolean[] = [];
+  broker.addBridgeStateListener(({ connected }) => { events.push(connected); });
+  await broker.start();
+
+  const bridge = await connectBridge(port, 'ext-report');
+  await waitFor(() => broker.probeConnectivity().bridgeConnected, 1_000, 'bridge connect');
+  bridge.close();
+  await waitFor(() => !broker.probeConnectivity().bridgeConnected, 1_000, 'bridge drop');
+
+  assert.deepEqual(events, [true, false]);
+  await broker.stop();
+});
+
+test('a secondary heals itself in the background when the primary dies, with no tool call', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-bgheal-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+
+  // Primary vanishes. Nobody calls a browser tool. The secondary must still take
+  // over the port promptly so the Chrome extension has something to reconnect to.
+  await primary.stop();
+  await waitFor(() => remote.probeConnectivity().role === 'promoted', 5_000, 'background promotion');
+  assert.equal(remote.probeConnectivity().brokerListening, true);
+
+  await remote.stop();
+});
+
+test('a proxy secondary never claims a live bridge once its socket to the primary is gone', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+  const bridge = await connectBridge(port, 'ext-proxy');
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-stale-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+  await remote.ensureReady({ waitForBridgeMs: 1_000 });
+  assert.equal(remote.probeConnectivity().bridgeConnected, true);
+
+  // Kill the proxy socket without refreshing the cached snapshot.
+  (remote as any).socket?.terminate();
+  (remote as any).socket = null;
+  assert.equal(remote.probeConnectivity().bridgeConnected, false);
+
+  bridge.close();
+  await remote.stop();
+  await primary.stop();
+});
+
+test('ensureReady() rebind leaves exactly one heartbeat interval running', async () => {
+  // Two live heartbeats flap the bridge forever: interval A clears isAlive and
+  // pings, interval B fires before the pong lands, sees isAlive===false and
+  // terminates a perfectly healthy bridge. The existing rebind test goes through
+  // stop(), which clears the timer and hides the leak, so this one closes the
+  // listener underneath the broker instead.
+  const port = await getFreePort();
+  const broker = await createBroker(port);
+
+  const heartbeats: Array<{ fn: () => void; timer: unknown; cleared: boolean }> = [];
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  (globalThis as any).setInterval = (fn: any, ms?: number, ...rest: any[]) => {
+    const timer = realSetInterval(fn, ms as number, ...rest);
+    if (ms === 25_000) heartbeats.push({ fn, timer, cleared: false });
+    return timer;
+  };
+  (globalThis as any).clearInterval = (timer: any) => {
+    for (const entry of heartbeats) {
+      if (entry.timer === timer) entry.cleared = true;
+    }
+    return realClearInterval(timer);
+  };
+
+  let bridge: WebSocket | undefined;
+  try {
+    await broker.start();
+    const listener = (broker as any).server;
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+
+    await broker.ensureReady({ waitForBridgeMs: 0 });
+    assert.equal(broker.probeConnectivity().brokerListening, true);
+    assert.equal(heartbeats.length, 2, 'rebind should create a fresh heartbeat');
+    assert.equal(heartbeats.filter((entry) => !entry.cleared).length, 1, 'only one heartbeat may survive');
+
+    bridge = await connectBridge(port, 'ext-heartbeat');
+    await waitFor(() => broker.probeConnectivity().bridgeConnected, 1_000, 'bridge connect after rebind');
+
+    // Drive every heartbeat callback that was ever created, several rounds over,
+    // allowing the pong to land between rounds. A leaked interval would kill the
+    // bridge inside the very first round.
+    for (let round = 0; round < 3; round += 1) {
+      for (const entry of heartbeats) entry.fn();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(broker.probeConnectivity().bridgeConnected, true);
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+    bridge?.close();
+    await broker.stop();
+  }
+});
+
+test('a remote broker restarted after stop() resumes background healing', async () => {
+  // Ctrl+Z stops the broker and SIGCONT start()s the same instance. If stop()'s
+  // `stopped` flag is never cleared, every heal path is dead for the rest of the
+  // process's life and the session silently loses all recovery.
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-resume-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+
+  await remote.stop();
+  await remote.start();
+  assert.equal(remote.probeConnectivity().brokerListening, true);
+
+  await primary.stop();
+  await waitFor(() => remote.probeConnectivity().role === 'promoted', 5_000, 'background promotion after resume');
+
+  await remote.stop();
+});
+
+test('a lazy handle keeps its proxy across a not-listening window and stays the only port owner', async () => {
+  // Dropping the proxy here orphaned a broker that kept its heal loop and could
+  // still bind the port, so one process ended up with two competing brokers.
+  const port = await getFreePort();
+  const blocker = await startPortBlocker(port);
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-lazyproxy-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 500,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await assert.rejects(() => remote.start(), /not a pi-browser-agent broker/i);
+
+  const handle = new LazyBrokerHandle(
+    async () => remote as any,
+    new TaskStore({ dir: join(root, 'handle-tasks') }),
+    `ws://127.0.0.1:${port}`,
+  );
+  handle.adopt(remote as any);
+
+  await handle.ensureReady({ waitForBridgeMs: 0 });
+  assert.equal(handle.probeConnectivity().brokerListening, false);
+  assert.equal(handle.resolved, remote, 'a proxy must survive a not-listening window');
+
+  // Port frees up: the SAME object heals itself into the new primary.
+  await blocker.close();
+  await handle.ensureReady({ waitForBridgeMs: 0 });
+  await waitFor(() => remote.probeConnectivity().role === 'promoted', 5_000, 'self-promotion');
+  assert.equal(handle.resolved, remote);
+
+  // ...and it is the only owner of the port.
+  const intruder = await createBroker(port);
+  await assert.rejects(() => intruder.start(), /EADDRINUSE|address already in use/i);
+
+  await remote.stop();
+});
+
+test('a disposed lazy handle never re-binds the port after session shutdown', async () => {
+  const port = await getFreePort();
+  const broker = await createBroker(port);
+  await broker.start();
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-dispose-'));
+  const handle = new LazyBrokerHandle(
+    async () => broker as any,
+    new TaskStore({ dir: join(root, 'tasks') }),
+    `ws://127.0.0.1:${port}`,
+  );
+  handle.adopt(broker as any);
+
+  // session_shutdown: stop the broker, then disarm the handle the tools still hold.
+  await broker.stop();
+  handle.dispose();
+
+  await handle.ensureReady({ waitForBridgeMs: 0 });
+  await assert.rejects(() => handle.request('browser_list_tabs', {}), /E_BRIDGE_DISCONNECTED/);
+  const probe = handle.probeConnectivity();
+  assert.equal(probe.brokerListening, false);
+  assert.match(String(probe.startupError), /shut down with this pi session/i);
+
+  // Nothing was resurrected behind our back: a fresh broker still gets the port.
+  const successor = await createBroker(port);
+  await successor.start();
+  assert.equal(successor.probeConnectivity().brokerListening, true);
+  await successor.stop();
+});
+
+test('a proxy is told when the primary loses its Chrome bridge, without polling', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+  const bridge = await connectBridge(port, 'ext-notify');
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-notify-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+  await remote.ensureReady({ waitForBridgeMs: 1_000 });
+  assert.equal(remote.probeConnectivity().bridgeConnected, true);
+
+  const events: boolean[] = [];
+  remote.addBridgeStateListener(({ connected }) => { events.push(connected); });
+
+  bridge.close();
+  await waitFor(() => events.includes(false), 2_000, 'pushed bridge_state notification');
+  assert.equal(remote.probeConnectivity().bridgeConnected, false);
+
+  await remote.stop();
+  await primary.stop();
+});
+
+async function connectBridge(port: number, extensionId: string): Promise<WebSocket> {
+  return await new Promise<WebSocket>((resolve, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+    socket.once('error', reject);
+    socket.once('open', () => socket.send(JSON.stringify({
+      v: 1, kind: 'hello', extensionId, version: '0.1.0', capabilities: ['browser_list_tabs'],
+    })));
+    socket.once('message', () => resolve(socket));
+  });
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}

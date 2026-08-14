@@ -2,6 +2,7 @@ import { Type } from '@sinclair/typebox';
 
 import type { ProbeResult } from '../broker/protocol.ts';
 import type { BrowserAgentBroker } from '../broker/server.ts';
+import { formatBridgeFailure } from '../broker/diagnostics.ts';
 import { truncateAndSpill } from '../util/truncate.ts';
 
 interface ToolResult {
@@ -37,8 +38,15 @@ async function brokerToolRequest(
   timeoutMs: number,
 ): Promise<{ ok: true; data: unknown } | { ok: false; error: { code: string; message: string; details?: unknown } }> {
   try {
-    // Lazily (re)acquire the broker so a killed primary is replaced on demand.
+    // Lazily (re)acquire the broker (and wait out the extension's reconnect
+    // window) so a killed primary or a bounced service worker is healed on
+    // demand instead of failing the call.
     await broker.ensureReady?.();
+    const probe = broker.probeConnectivity();
+    if (!probe.brokerListening || !probe.bridgeConnected) {
+      const { text, diagnostics } = formatBridgeFailure(probe, type);
+      return { ok: false, error: { code: 'E_BRIDGE_DISCONNECTED', message: text, details: { probe, diagnostics } } };
+    }
     const response = await broker.request(type, params, { timeoutMs });
     if (!response.ok) {
       return {

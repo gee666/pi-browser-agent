@@ -7,6 +7,7 @@ interface BridgeSocket extends WebSocket {
 
 import {
   createErrorResponseFrame,
+  createNotifyFrame,
   createResponseFrame,
   createWelcomeFrame,
   parseIncomingFrame,
@@ -34,6 +35,43 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/** How long a tool call waits for the Chrome extension bridge to (re)appear
+ *  before giving up. The extension reconnect backoff is capped at 5s and it has
+ *  a 30s chrome.alarms cold-start backstop, so ~8s covers every warm reconnect
+ *  and every "the primary pi process just died and we promoted" handoff. */
+export const DEFAULT_BRIDGE_WAIT_MS = parsePositiveInt(process.env.PI_BA_BRIDGE_WAIT_MS, 8_000);
+
+/** Short wait used when there is no reason to believe a bridge is coming back
+ *  (Chrome not running / extension disabled), so tools fail fast instead of
+ *  stalling every call for the full budget. */
+export const COLD_BRIDGE_WAIT_MS = 1_500;
+
+/** Grace period after the listener comes up during which we still use the full
+ *  wait budget even though no bridge has ever connected — the extension needs a
+ *  moment to notice the new listener. */
+const FRESH_LISTENER_GRACE_MS = 20_000;
+
+/** Number of consecutive full-budget waits that end without a bridge before we
+ *  conclude the browser side is simply absent. */
+export const COLD_MEMO_MISS_THRESHOLD = 2;
+
+/** How long the "browser is cold" conclusion is trusted. Long enough to stop
+ *  every tool call paying the full budget, short enough that a browser that
+ *  comes back is picked up again quickly. */
+export const COLD_MEMO_TTL_MS = 30_000;
+
+export interface BridgeStateEvent {
+  connected: boolean;
+  probe: ProbeResult;
+}
+
+export type BridgeStateListener = (state: BridgeStateEvent) => void;
+
+export interface EnsureReadyOptions {
+  /** Override the bridge wait budget. 0 disables waiting entirely. */
+  waitForBridgeMs?: number;
+}
+
 export class BrowserAgentBroker {
   readonly host: string;
   /** Port the broker actually bound to. Equals `preferredPort` after a clean
@@ -57,6 +95,24 @@ export class BrowserAgentBroker {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private sockets = new Set<BridgeSocket>();
+  private listeningSince: number | null = null;
+  private bridgeEverConnected = false;
+  private lastBridgeConnectedAt: number | null = null;
+  private lastBridgeDisconnectedAt: number | null = null;
+  private lastBridgeDisconnectReason: string | null = null;
+  private bridgeWaiters = new Set<(connected: boolean) => void>();
+  /** Notified whenever the bridge transitions connected <-> disconnected so the
+   *  host process can surface the state to the user instead of leaving them
+   *  guessing why their agents "lost the browser". A set, not a single slot:
+   *  several pi sessions live in one process and a single slot silenced all but
+   *  the last one to start. */
+  private bridgeStateListeners = new Set<BridgeStateListener>();
+  /** Guards the heartbeat interval against a rebind that did not go through
+   *  stop(): two live intervals make each other's pings look like heartbeat
+   *  timeouts and permanently kill every bridge that connects. */
+  private listenerEpoch = 0;
+  private coldBridgeMisses = 0;
+  private coldBridgeSince: number | null = null;
 
   constructor({
     host = process.env.PI_BA_HOST || '127.0.0.1',
@@ -101,19 +157,30 @@ export class BrowserAgentBroker {
 
     this.startupError = null;
 
+    // A previous listener generation may still have a heartbeat running (e.g.
+    // ensureReady() rebinding without stop()). Two intervals would race each
+    // other's pings and terminate every bridge that connects.
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+
     try {
       await this.taskStore.init();
       await this.taskStore.gc();
       await this.bindWithFallback();
+      this.listeningSince = Date.now();
 
+      const epoch = ++this.listenerEpoch;
       this.pingTimer = setInterval(() => {
+        if (epoch !== this.listenerEpoch) return;
         const socket = this.bridgeSocket as BridgeSocket | null;
         if (!socket) {
           return;
         }
         if (socket.isAlive === false) {
           this.logger.warn?.('[pi-browser-agent] bridge heartbeat timed out');
-          this.failBridge(socket, new Error('E_BRIDGE_DISCONNECTED'));
+          this.failBridge(socket, new Error('E_BRIDGE_DISCONNECTED'), 'heartbeat timeout (no pong within 25s)');
           try {
             socket.terminate();
           } catch (error) {
@@ -148,14 +215,144 @@ export class BrowserAgentBroker {
    *  (e.g. another process already won the port) it leaves `startupError` set so
    *  `probeConnectivity()` reports not-listening and the caller surfaces a clear
    *  message, while a later request can still retry. */
-  async ensureReady(): Promise<void> {
-    if (this.server) {
+  async ensureReady(options: EnsureReadyOptions = {}): Promise<void> {
+    // 1. Make sure we still actually own a live listener. A WebSocketServer can
+    //    be closed underneath us (or never have bound), and `this.server`
+    //    alone is not proof of liveness — check the bound address too.
+    if (this.server && !this.isListening()) {
+      const dead = this.server;
+      this.server = null;
+      this.listeningSince = null;
+      if (this.pingTimer) {
+        clearInterval(this.pingTimer);
+        this.pingTimer = null;
+      }
+      try { dead.close(); } catch { /* ignore */ }
+    }
+
+    if (!this.server) {
+      try {
+        await this.start();
+      } catch (error) {
+        this.logger.warn?.('[pi-browser-agent] ensureReady: broker (re)start failed', error);
+        return;
+      }
+    }
+
+    // 2. We are listening. We cannot dial Chrome, but the extension reconnects
+    //    on its own within a few seconds, so absorb that window here instead of
+    //    failing a tool call that arrived mid-reconnect. This is what makes the
+    //    integration self-healing from the agent's point of view.
+    const budget = this.resolveBridgeWaitMs(options);
+    const connected = await this.waitForBridge(budget);
+    this.recordBridgeWaitOutcome(connected, budget);
+  }
+
+  /** Remember that the full budget was burned without a bridge showing up, so
+   *  the next calls fail fast instead of stalling the agent for 8s each time a
+   *  user has Chrome closed. */
+  private recordBridgeWaitOutcome(connected: boolean, budget: number): void {
+    if (connected) {
+      this.coldBridgeMisses = 0;
+      this.coldBridgeSince = null;
       return;
     }
+    if (budget < DEFAULT_BRIDGE_WAIT_MS) return;
+    this.coldBridgeMisses += 1;
+    if (this.coldBridgeMisses >= COLD_MEMO_MISS_THRESHOLD) {
+      this.coldBridgeSince = Date.now();
+    }
+  }
+
+  private resolveBridgeWaitMs({ waitForBridgeMs }: EnsureReadyOptions): number {
+    if (typeof waitForBridgeMs === 'number') {
+      return Math.max(0, waitForBridgeMs);
+    }
+    if (this.coldBridgeSince !== null && Date.now() - this.coldBridgeSince < COLD_MEMO_TTL_MS) {
+      return COLD_BRIDGE_WAIT_MS;
+    }
+    if (this.bridgeEverConnected) {
+      return DEFAULT_BRIDGE_WAIT_MS;
+    }
+    // Freshly bound listener: give the extension time to discover us.
+    if (this.listeningSince !== null && Date.now() - this.listeningSince < FRESH_LISTENER_GRACE_MS) {
+      return DEFAULT_BRIDGE_WAIT_MS;
+    }
+    return COLD_BRIDGE_WAIT_MS;
+  }
+
+  private isListening(): boolean {
+    const server = this.server;
+    if (!server) return false;
     try {
-      await this.start();
-    } catch (error) {
-      this.logger.warn?.('[pi-browser-agent] ensureReady: broker (re)start failed', error);
+      return server.address() !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Resolve as soon as a Chrome extension bridge is connected, or after
+   *  `timeoutMs`. Never rejects — callers decide what to do with a still-absent
+   *  bridge. */
+  async waitForBridge(timeoutMs: number): Promise<boolean> {
+    if (this.bridgeSocket && this.bridgeHello) return true;
+    if (!this.server || timeoutMs <= 0) return false;
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        this.bridgeWaiters.delete(waiter);
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const waiter = (connected: boolean) => finish(connected);
+      const timer = setTimeout(() => finish(!!this.bridgeSocket && !!this.bridgeHello), timeoutMs);
+      timer.unref?.();
+      this.bridgeWaiters.add(waiter);
+    });
+  }
+
+  private notifyBridgeWaiters(connected: boolean): void {
+    const waiters = [...this.bridgeWaiters];
+    this.bridgeWaiters.clear();
+    for (const waiter of waiters) {
+      try { waiter(connected); } catch { /* ignore */ }
+    }
+  }
+
+  /** Subscribe to bridge connect/disconnect transitions. Returns an
+   *  unsubscribe function; call it when a session ends so a dead session does
+   *  not keep receiving (or swallowing) notifications. */
+  addBridgeStateListener(listener: BridgeStateListener): () => void {
+    this.bridgeStateListeners.add(listener);
+    return () => {
+      this.bridgeStateListeners.delete(listener);
+    };
+  }
+
+  private emitBridgeStateChange(connected: boolean): void {
+    const probe = this.probeConnectivity();
+    for (const listener of [...this.bridgeStateListeners]) {
+      try {
+        listener({ connected, probe });
+      } catch (error) {
+        this.logger.warn?.('[pi-browser-agent] bridge state listener failed', error);
+      }
+    }
+
+    // Peer pi brokers proxy through us and cannot see our bridge directly. Push
+    // the transition so their users are told the browser went away instead of
+    // being left with a stale "connected" snapshot until the next poll.
+    const payload = JSON.stringify(createNotifyFrame('bridge_state', probe));
+    for (const socket of this.sockets) {
+      if (socket === this.bridgeSocket) continue;
+      try {
+        socket.send(payload);
+      } catch (error) {
+        this.logger.warn?.('[pi-browser-agent] failed to notify peer broker', error);
+      }
     }
   }
 
@@ -239,6 +436,11 @@ export class BrowserAgentBroker {
 
     this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
 
+    // Anyone parked in waitForBridge() must be released now; otherwise a tool
+    // call that raced the shutdown hangs for the whole 8s budget.
+    this.notifyBridgeWaiters(false);
+    this.bridgeStateListeners.clear();
+
     for (const socket of this.sockets) {
       try {
         socket.close();
@@ -257,6 +459,8 @@ export class BrowserAgentBroker {
         this.bridgeHello = null;
       }
     }
+
+    this.listeningSince = null;
 
     if (this.server) {
       const server = this.server;
@@ -330,7 +534,7 @@ export class BrowserAgentBroker {
   probeConnectivity(): ProbeResult {
     return {
       brokerReachable: !this.startupError,
-      brokerListening: !!this.server && !this.startupError,
+      brokerListening: this.isListening() && !this.startupError,
       bridgeConnected: !!this.bridgeSocket && !!this.bridgeHello,
       bridgeVersion: this.bridgeHello?.version,
       capabilities: this.bridgeHello?.capabilities,
@@ -338,6 +542,13 @@ export class BrowserAgentBroker {
       url: this.url,
       bridgeSessionSerial: this.bridgeSessionSerial,
       supportsBrokerProxy: true,
+      role: 'primary',
+      ownerPid: process.pid,
+      listeningSince: this.listeningSince ? new Date(this.listeningSince).toISOString() : undefined,
+      bridgeEverConnected: this.bridgeEverConnected,
+      lastBridgeConnectedAt: this.lastBridgeConnectedAt ? new Date(this.lastBridgeConnectedAt).toISOString() : undefined,
+      lastBridgeDisconnectedAt: this.lastBridgeDisconnectedAt ? new Date(this.lastBridgeDisconnectedAt).toISOString() : undefined,
+      lastBridgeDisconnectReason: this.lastBridgeDisconnectReason ?? undefined,
     };
   }
 
@@ -356,12 +567,13 @@ export class BrowserAgentBroker {
 
     bridgeSocket.on('error', (error: Error) => {
       this.logger.warn?.('[pi-browser-agent] bridge socket error', error);
-      this.failBridge(bridgeSocket, error);
+      this.failBridge(bridgeSocket, error, `socket error: ${error.message}`);
     });
 
-    bridgeSocket.on('close', () => {
+    bridgeSocket.on('close', (code?: number, reason?: Buffer) => {
       this.sockets.delete(bridgeSocket);
-      this.failBridge(bridgeSocket, new Error('E_BRIDGE_DISCONNECTED'));
+      const detail = reason?.length ? ` ${reason.toString()}` : '';
+      this.failBridge(bridgeSocket, new Error('E_BRIDGE_DISCONNECTED'), `socket closed (code ${code ?? 'unknown'})${detail}`);
     });
 
     bridgeSocket.on('message', (buffer: RawData) => {
@@ -381,13 +593,17 @@ export class BrowserAgentBroker {
     }
   }
 
-  private failBridge(socket: BridgeSocket, error: Error): void {
+  private failBridge(socket: BridgeSocket, error: Error, reason?: string): void {
     if (this.bridgeSocket !== socket) {
       return;
     }
     this.bridgeSocket = null;
     this.bridgeHello = null;
+    this.lastBridgeDisconnectedAt = Date.now();
+    this.lastBridgeDisconnectReason = reason ?? error.message;
     this.rejectPendingRequests(error);
+    this.logger.warn?.('[pi-browser-agent] browser extension bridge lost', { reason: this.lastBridgeDisconnectReason });
+    this.emitBridgeStateChange(false);
   }
 
   private handleRawMessage(socket: WebSocket, raw: string): void {
@@ -402,7 +618,13 @@ export class BrowserAgentBroker {
       this.bridgeSocket = socket;
       this.bridgeHello = frame;
       this.bridgeSessionSerial += 1;
+      this.bridgeEverConnected = true;
+      this.lastBridgeConnectedAt = Date.now();
+      this.coldBridgeMisses = 0;
+      this.coldBridgeSince = null;
       socket.send(JSON.stringify(createWelcomeFrame('0.0.0')));
+      this.notifyBridgeWaiters(true);
+      this.emitBridgeStateChange(true);
 
       if (isHandoff && previous) {
         this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
