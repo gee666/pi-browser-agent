@@ -114,6 +114,7 @@ export class RemoteBrowserAgentBroker {
    *  none is listening) compete to become the new primary. Idempotent and safe
    *  to call concurrently — `promoteOrReconnect()` dedupes the bind race. */
   async ensureReady(options: EnsureReadyOptions = {}): Promise<void> {
+    if (this.stopped) return;
     if (this.promotedBroker) {
       await this.promotedBroker.ensureReady(options);
       return;
@@ -240,11 +241,27 @@ export class RemoteBrowserAgentBroker {
     this.stopped = true;
     this.cancelHealTimer();
     this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
+    const connecting = this.connectPromise;
     const socket = this.socket;
     this.socket = null;
-    this.connectPromise = null;
     if (socket) {
       try { socket.close(); } catch { /* ignore */ }
+    }
+    // A connect or promotion already in flight can otherwise publish a socket
+    // or listener after stop() returns. Their completion paths observe
+    // `stopped` and tear down instead of publishing.
+    if (connecting) {
+      try { await connecting; } catch { /* expected during shutdown */ }
+    }
+    this.connectPromise = null;
+    const promotion = this.promotionPromise;
+    if (promotion) {
+      try { await promotion; } catch { /* promotion failure is already logged */ }
+    }
+    const lateSocket = this.socket;
+    this.socket = null;
+    if (lateSocket) {
+      try { lateSocket.close(); } catch { /* ignore */ }
     }
     this.unsubscribePromoted?.();
     this.unsubscribePromoted = null;
@@ -258,6 +275,7 @@ export class RemoteBrowserAgentBroker {
   }
 
   async request(type: string, params: unknown, options: { timeoutMs?: number } = {}): Promise<ResponseFrame> {
+    if (this.stopped) throw new Error('E_BRIDGE_DISCONNECTED');
     if (this.promotedBroker) {
       return await this.promotedBroker.request(type, params, options);
     }
@@ -366,6 +384,7 @@ export class RemoteBrowserAgentBroker {
   }
 
   private async ensureConnected(): Promise<void> {
+    if (this.stopped) throw new Error('Browser broker is stopped');
     if (this.socket?.readyState === WebSocket.OPEN) return;
     if (this.connectPromise) return await this.connectPromise;
 
@@ -397,6 +416,10 @@ export class RemoteBrowserAgentBroker {
       };
 
       socket.once('open', () => {
+        if (this.stopped) {
+          fail(new Error('Browser broker is stopped'));
+          return;
+        }
         settled = true;
         clearTimeout(connectTimeout);
         this.socket = socket;
@@ -475,6 +498,7 @@ export class RemoteBrowserAgentBroker {
   }
 
   private async promoteOrReconnect(): Promise<BrowserAgentBroker | null> {
+    if (this.stopped) return null;
     if (this.promotedBroker) return this.promotedBroker;
     if (this.promotionPromise) return await this.promotionPromise;
 
@@ -492,6 +516,10 @@ export class RemoteBrowserAgentBroker {
       });
       try {
         await candidate.start();
+        if (this.stopped) {
+          await candidate.stop();
+          return null;
+        }
         this.unsubscribePromoted?.();
         this.unsubscribePromoted = candidate.addBridgeStateListener((state) => this.emitBridgeState(state));
         this.promotedBroker = candidate;
@@ -515,7 +543,8 @@ export class RemoteBrowserAgentBroker {
           return null;
         }
         // Someone else won the race. Reconnect to the new primary and refresh
-        // our probe snapshot.
+        // our probe snapshot, unless shutdown won the race first.
+        if (this.stopped) return null;
         try {
           await this.ensureConnected();
           this.remoteProbe = await this.probePrimary();

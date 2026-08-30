@@ -18,6 +18,12 @@ type ExtensionContextLike = { ui?: ExtensionUi };
 
 let brokerSingleton: BrowserAgentBrokerLike | null = null;
 let brokerStartup: Promise<BrowserAgentBrokerLike> | null = null;
+/** Invalidates an acquisition that was already in flight when shutdown began. */
+let brokerLifecycleGeneration = 0;
+/** Separately invalidates session setup. Suspend must not do this: tools still
+ *  need to finish registering while broker acquisition is paused. */
+let sessionLifecycleGeneration = 0;
+let brokerShuttingDown = false;
 let startupMessage: string | null = null;
 /** Handles handed to the browser_* tools. They outlive the broker, so shutdown
  *  has to disarm them explicitly or a late tool call re-binds the port. */
@@ -34,9 +40,18 @@ export function getStartupMessage(): string | null {
 }
 
 export async function resetForTests(): Promise<void> {
-  if (brokerSingleton) {
+  brokerShuttingDown = true;
+  brokerLifecycleGeneration += 1;
+  sessionLifecycleGeneration += 1;
+  const startup = brokerStartup;
+  if (startup) {
+    try { await startup; } catch { /* invalidated startup stops itself */ }
+  }
+  const broker = brokerSingleton;
+  brokerSingleton = null;
+  if (broker) {
     try {
-      await brokerSingleton.stop();
+      await broker.stop();
     } catch {
       // ignore in tests; callers are resetting state intentionally
     }
@@ -49,9 +64,9 @@ export async function resetForTests(): Promise<void> {
     handle.dispose();
   }
   activeHandles.clear();
-  brokerSingleton = null;
   brokerStartup = null;
   startupMessage = null;
+  brokerShuttingDown = false;
 }
 
 function formatLogArg(value: unknown): string {
@@ -176,11 +191,16 @@ function installSuspendResumeHandlers(): void {
   process.on('SIGTSTP', () => {
     if (suspending) return;
     suspending = true;
+    brokerShuttingDown = true;
+    brokerLifecycleGeneration += 1;
+    const startup = brokerStartup;
     const broker = brokerSingleton;
     void (async () => {
       try {
-        // Abort any in-flight startup and release the port + bridge.
-        brokerStartup = null;
+        // Invalidate and await any in-flight startup before releasing the port.
+        if (startup) {
+          try { await startup; } catch { /* cancelled/failed startup */ }
+        }
         if (broker) {
           await broker.stop();
           try { await removeInstanceFile(process.pid); } catch { /* ignore */ }
@@ -198,6 +218,7 @@ function installSuspendResumeHandlers(): void {
   process.on('SIGCONT', () => {
     if (!suspending) return;
     suspending = false;
+    brokerShuttingDown = false;
     const broker = brokerSingleton;
     if (!broker) return;
     void (async () => {
@@ -282,6 +303,10 @@ function attachPromotionReporter(broker: BrowserAgentBrokerLike, logger: BrokerL
 }
 
 async function getOrCreateBroker(logger: BrokerLogger): Promise<BrowserAgentBrokerLike> {
+  if (brokerShuttingDown) {
+    throw new Error('Browser broker is shutting down');
+  }
+
   // If an existing broker is healthy, reuse it.
   if (brokerSingleton) {
     const probe = brokerSingleton.probeConnectivity();
@@ -291,29 +316,53 @@ async function getOrCreateBroker(logger: BrokerLogger): Promise<BrowserAgentBrok
     // Non-listening singleton (e.g. after a prior failure). Stop it before
     // dropping the reference: an abandoned broker keeps its heal timers and can
     // still bind the port, giving this process two competing brokers.
-    const stale = brokerSingleton;
-    brokerSingleton = null;
-    void stale.stop().catch(() => {});
   }
 
-  // Serialize startup: at most one in-flight start attempt at a time.
+  // Serialize startup (including stale teardown): at most one replacement can
+  // stop/bind/publish at a time.
   if (brokerStartup) {
     return await brokerStartup;
   }
 
-  brokerStartup = (async () => {
+  const generation = brokerLifecycleGeneration;
+  let startup!: Promise<BrowserAgentBrokerLike>;
+  startup = (async () => {
     try {
+      const stale = brokerSingleton;
+      if (stale && !stale.probeConnectivity().brokerListening) {
+        brokerSingleton = null;
+        try {
+          await stale.stop();
+        } catch (error) {
+          logger.warn?.('[pi-browser-agent] stale broker cleanup failed', error);
+          throw error;
+        }
+      }
+
+      if (brokerShuttingDown || generation !== brokerLifecycleGeneration) {
+        throw new Error('Browser broker startup was cancelled by shutdown');
+      }
+
       const broker = await createAndStartBroker(logger);
-      // Only publish a broker as the singleton after a successful bind.
+      // Shutdown may have begun while task-store setup or the socket bind was
+      // in flight. Never publish that late broker, and await its teardown so it
+      // cannot reclaim the port after shutdown returns.
+      if (brokerShuttingDown || generation !== brokerLifecycleGeneration) {
+        await broker.stop();
+        throw new Error('Browser broker startup was cancelled by shutdown');
+      }
       brokerSingleton = broker;
       return broker;
     } finally {
-      // Clear the in-flight promise so subsequent starts can retry on failure.
-      brokerStartup = null;
+      // Do not let an older attempt clear a newer attempt's promise.
+      if (brokerStartup === startup) {
+        brokerStartup = null;
+      }
     }
   })();
+  brokerStartup = startup;
 
-  return await brokerStartup;
+  return await startup;
 }
 
 export default async function piBrowserAgentExtension(pi: {
@@ -321,6 +370,7 @@ export default async function piBrowserAgentExtension(pi: {
   registerTool: (tool: any) => void;
 }) {
   const registerSessionTool = async (ctx?: ExtensionContextLike) => {
+    const sessionGeneration = sessionLifecycleGeneration;
     resetBrowserAgentToolState();
     resetRegisteredBrowserTools();
     const logger = createUiLogger(ctx);
@@ -350,6 +400,12 @@ export default async function piBrowserAgentExtension(pi: {
     // initialised here — it is a different instance from the broker's.
     const taskStore = new TaskStore({ dir: join(await ensureStateDir('tasks')) });
     await taskStore.init();
+    // session_shutdown may have completed while the per-session task store was
+    // being prepared, before this session had a handle or brokerStartup for it
+    // to invalidate. Do not let that delayed setup rebind after shutdown.
+    if (sessionGeneration !== sessionLifecycleGeneration) {
+      return;
+    }
     const handle = new LazyBrokerHandle(async () => {
       const broker = await getOrCreateBroker(logger);
       attachReporters(broker);
@@ -391,7 +447,10 @@ export default async function piBrowserAgentExtension(pi: {
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
-    brokerStartup = null;
+    brokerShuttingDown = true;
+    brokerLifecycleGeneration += 1;
+    sessionLifecycleGeneration += 1;
+    const startup = brokerStartup;
     for (const cleanup of [...sessionCleanups]) {
       try { cleanup(); } catch { /* ignore */ }
     }
@@ -402,15 +461,16 @@ export default async function piBrowserAgentExtension(pi: {
       handle.dispose();
     }
     activeHandles.clear();
-    if (!brokerSingleton) {
-      startupMessage = null;
-      return;
+    // Await an in-flight acquisition. Its generation check tears down any
+    // broker that finished binding after shutdown started.
+    if (startup) {
+      try { await startup; } catch { /* cancelled/failed startup */ }
     }
     const broker = brokerSingleton;
     brokerSingleton = null;
     startupMessage = null;
     try {
-      await broker.stop();
+      if (broker) await broker.stop();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx?.ui?.notify?.(`pi-browser-agent shutdown failed: ${message}`, 'warning');
@@ -421,6 +481,7 @@ export default async function piBrowserAgentExtension(pi: {
         const message = error instanceof Error ? error.message : String(error);
         ctx?.ui?.notify?.(`pi-browser-agent instance cleanup failed: ${message}`, 'warning');
       }
+      brokerShuttingDown = false;
     }
   });
 }

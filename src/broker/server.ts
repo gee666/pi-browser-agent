@@ -113,6 +113,10 @@ export class BrowserAgentBroker {
   private listenerEpoch = 0;
   private coldBridgeMisses = 0;
   private coldBridgeSince: number | null = null;
+  /** Serializes listener lifecycle transitions. In particular, a stop requested
+   *  while start() is still binding must run after that bind and tear it down,
+   *  rather than observing `server === null` and letting the late bind escape. */
+  private lifecycleTail: Promise<void> = Promise.resolve();
 
   constructor({
     host = process.env.PI_BA_HOST || '127.0.0.1',
@@ -150,12 +154,13 @@ export class BrowserAgentBroker {
     return `ws://${this.host}:${this.port}`;
   }
 
-  async start(): Promise<void> {
-    if (this.server) {
-      return;
-    }
+  start(): Promise<void> {
+    return this.serializeLifecycle(async () => {
+      if (this.server) {
+        return;
+      }
 
-    this.startupError = null;
+      this.startupError = null;
 
     // A previous listener generation may still have a heartbeat running (e.g.
     // ensureReady() rebinding without stop()). Two intervals would race each
@@ -206,6 +211,15 @@ export class BrowserAgentBroker {
       }
       throw this.startupError;
     }
+    });
+  }
+
+  private serializeLifecycle(operation: () => Promise<void>): Promise<void> {
+    const result = this.lifecycleTail.then(operation, operation);
+    // Keep the queue usable after a failed bind; callers still receive the
+    // original rejection through `result`.
+    this.lifecycleTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   /** Lazily (re)acquire the broker listener on demand. Tools call this at the
@@ -426,8 +440,9 @@ export class BrowserAgentBroker {
     });
   }
 
-  async stop(): Promise<void> {
-    const closeErrors: Error[] = [];
+  stop(): Promise<void> {
+    return this.serializeLifecycle(async () => {
+      const closeErrors: Error[] = [];
 
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
@@ -492,6 +507,7 @@ export class BrowserAgentBroker {
       this.logger.error?.('[pi-browser-agent] broker shutdown failed', this.shutdownError);
       throw new AggregateError(closeErrors, 'Broker shutdown failed');
     }
+    });
   }
 
   async request(type: string, params: unknown, options: { timeoutMs?: number } = {}): Promise<ResponseFrame> {

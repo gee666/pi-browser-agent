@@ -71,6 +71,43 @@ async function createBroker(port: number, opts: { portRange?: number; fallbackTo
   });
 }
 
+test('concurrent start() calls share one listener lifecycle', async () => {
+  const port = await getFreePort();
+  const broker = await createBroker(port);
+
+  await Promise.all(Array.from({ length: 12 }, () => broker.start()));
+
+  assert.equal(broker.probeConnectivity().brokerListening, true);
+  assert.equal(broker.port, port);
+  await broker.stop();
+});
+
+test('stop() racing an in-flight start() tears down the late listener', async () => {
+  const port = await getFreePort();
+  const broker = await createBroker(port);
+  let releaseInit!: () => void;
+  let initEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { initEntered = resolve; });
+  const release = new Promise<void>((resolve) => { releaseInit = resolve; });
+  const originalInit = broker.taskStore.init.bind(broker.taskStore);
+  (broker.taskStore as any).init = async () => {
+    initEntered();
+    await release;
+    await originalInit();
+  };
+
+  const starting = broker.start();
+  await entered;
+  const stopping = broker.stop();
+  releaseInit();
+  await Promise.all([starting, stopping]);
+
+  assert.equal(broker.probeConnectivity().brokerListening, false);
+  const successor = await createBroker(port);
+  await successor.start();
+  await successor.stop();
+});
+
 test('broker probe reports server-only and bridge-connected states', async () => {
   const port = await getFreePort();
   const broker = await createBroker(port);
@@ -832,6 +869,83 @@ test('ensureReady() rebind leaves exactly one heartbeat interval running', async
     bridge?.close();
     await broker.stop();
   }
+});
+
+test('remote stop() awaits an in-flight promotion and prevents a late bind', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-stop-promotion-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+  await primary.stop();
+
+  let initEntered!: () => void;
+  let releaseInit!: () => void;
+  const entered = new Promise<void>((resolve) => { initEntered = resolve; });
+  const release = new Promise<void>((resolve) => { releaseInit = resolve; });
+  const originalInit = remote.taskStore.init.bind(remote.taskStore);
+  (remote.taskStore as any).init = async () => {
+    initEntered();
+    await release;
+    await originalInit();
+  };
+
+  const promotion = (remote as any).promoteOrReconnect() as Promise<BrowserAgentBroker | null>;
+  await entered;
+  const stopping = remote.stop();
+  releaseInit();
+  await Promise.all([promotion, stopping]);
+
+  assert.equal(remote.probeConnectivity().brokerListening, false);
+  const successor = await createBroker(port);
+  await successor.start();
+  await successor.stop();
+});
+
+test('an operation resuming after remote stop() cannot start a new promotion', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-late-promotion-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+  await remote.start();
+
+  let probeEntered!: () => void;
+  let releaseProbe!: () => void;
+  const entered = new Promise<void>((resolve) => { probeEntered = resolve; });
+  const release = new Promise<void>((resolve) => { releaseProbe = resolve; });
+  const originalProbe = (remote as any).probePrimary.bind(remote);
+  (remote as any).probePrimary = async () => {
+    probeEntered();
+    await release;
+    return await originalProbe();
+  };
+
+  const ensuring = remote.ensureReady({ waitForBridgeMs: 0 });
+  await entered;
+  await remote.stop();
+  await primary.stop();
+  releaseProbe();
+  await ensuring;
+
+  const successor = await createBroker(port);
+  await successor.start();
+  await successor.stop();
 });
 
 test('a remote broker restarted after stop() resumes background healing', async () => {
