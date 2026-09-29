@@ -78,7 +78,11 @@ Environment variables:
 - `PI_BA_PORT` — broker port, default `7878`
 - `PI_BA_TASK_TTL_DAYS` — task-history retention
 
-If port `7878` is busy, the broker fails fast and asks you to set `PI_BA_PORT`.
+If another pi instance owns port `7878`, this session connects through it. If acquisition fails, the extension retries in the background.
+
+## Connection status
+
+The status line shows `browser: connected`, `browser: recovering`, or `browser: disconnected`. Transient disconnects and successful recovery do not produce notifications. After 60 seconds without a connection, the extension shows one short warning for that outage and continues retrying quietly. Broker logs and stack traces are not forwarded to the TUI. Use `activate_browser_agent_tools` for on-demand diagnostics.
 
 ## WSL → Windows Chrome
 

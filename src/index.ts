@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { BrowserAgentBroker, type BrokerLogger } from './broker/server.ts';
 import { RemoteBrowserAgentBroker } from './broker/remote.ts';
 import { TaskStore } from './broker/task-store.ts';
+import { BrowserHealthReporter, quietBrokerLogger } from './broker/health-reporter.ts';
 import { ensureStateDir } from './util/paths.ts';
 import { listInstances, removeInstanceFile, writeInstanceFile } from './util/instances.ts';
 import { LazyBrokerHandle, type BrokerLike } from './broker/lazy.ts';
@@ -69,40 +70,6 @@ export async function resetForTests(): Promise<void> {
   brokerShuttingDown = false;
 }
 
-function formatLogArg(value: unknown): string {
-  if (value instanceof Error) {
-    return value.stack || value.message;
-  }
-  if (typeof value === 'string') {
-    return value;
-  }
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function createUiLogger(ctx?: ExtensionContextLike): BrokerLogger {
-  const notify = ctx?.ui?.notify;
-  if (typeof notify !== 'function') {
-    return { info() {}, warn() {}, error() {} };
-  }
-
-  const emit = (type: 'info' | 'warning' | 'error', args: unknown[]) => {
-    const message = args.map(formatLogArg).filter(Boolean).join(' ');
-    if (message) {
-      notify(message, type);
-    }
-  };
-
-  return {
-    info: (...args: unknown[]) => emit('info', args),
-    warn: (...args: unknown[]) => emit('warning', args),
-    error: (...args: unknown[]) => emit('error', args),
-  };
-}
-
 async function createAndStartBroker(logger: BrokerLogger): Promise<BrowserAgentBrokerLike> {
   const tasksDir = await ensureStateDir('tasks');
   const preferredPort = Number(process.env.PI_BA_PORT || 7878);
@@ -154,6 +121,9 @@ async function createAndStartBroker(logger: BrokerLogger): Promise<BrowserAgentB
     try {
       await remoteBroker.start();
     } catch (remoteError) {
+      // A failed handshake can leave an open socket and a background heal loop.
+      // Retire this candidate before a later acquisition tries again.
+      await remoteBroker.stop();
       const message = remoteError instanceof Error ? remoteError.message : String(remoteError);
       if (message.includes('not a pi-browser-agent broker')) {
         throw new Error(`Port ${preferredPort} is busy, but it is not pi-browser-agent`);
@@ -169,6 +139,7 @@ async function createAndStartBroker(logger: BrokerLogger): Promise<BrowserAgentB
 
 let signalHandlersInstalled = false;
 let suspending = false;
+let resumeGeneration = 0;
 
 /**
  * Make Ctrl+Z (SIGTSTP) graceful.
@@ -205,8 +176,8 @@ function installSuspendResumeHandlers(): void {
           await broker.stop();
           try { await removeInstanceFile(process.pid); } catch { /* ignore */ }
         }
-      } catch (error) {
-        console.warn('[pi-browser-agent] graceful suspend cleanup failed', error);
+      } catch {
+        // Resume and the session recovery loop will retry quietly.
       } finally {
         // Now actually suspend. SIGSTOP is uncatchable, so this reliably stops
         // the process just like the default Ctrl+Z behaviour would have.
@@ -218,6 +189,7 @@ function installSuspendResumeHandlers(): void {
   process.on('SIGCONT', () => {
     if (!suspending) return;
     suspending = false;
+    resumeGeneration += 1;
     brokerShuttingDown = false;
     const broker = brokerSingleton;
     if (!broker) return;
@@ -239,48 +211,11 @@ function installSuspendResumeHandlers(): void {
             });
           } catch { /* ignore */ }
         }
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException)?.code;
-        if (code === 'EADDRINUSE') {
-          // Another pi process became primary while we were suspended. That is
-          // fine: the lazy handle re-resolves this session into a proxy of the
-          // new primary on the next tool call, so no restart is needed.
-          console.warn('[pi-browser-agent] another pi instance owns the broker port after resume; this session re-resolves into a proxy of the new primary automatically');
-        } else {
-          console.warn('[pi-browser-agent] broker restart after resume failed', error);
-        }
+      } catch {
+        // Another process may own the port now. The session recovery loop
+        // re-resolves the lazy handle; the health reporter owns any warning.
       }
     })();
-  });
-}
-
-/**
- * Surface bridge health to the human running pi.
- *
- * The failure mode this guards against: the broker keeps listening, Chrome keeps
- * running, but the extension's service worker socket is gone — so every agent
- * reports "the connection is down" while the user sees nothing wrong. Now the
- * transition is announced in the UI the moment it happens.
- */
-function attachBridgeStateReporter(broker: BrowserAgentBrokerLike, ctx?: ExtensionContextLike): () => void {
-  const notify = ctx?.ui?.notify;
-  const setStatus = ctx?.ui?.setStatus;
-  // Per-subscription, not per-process: with a module global one session's
-  // transition suppressed every other session's notification.
-  let lastReportedBridgeState: boolean | null = null;
-  return broker.addBridgeStateListener(({ connected, probe }) => {
-    if (lastReportedBridgeState === connected) return;
-    lastReportedBridgeState = connected;
-    setStatus?.('browser-bridge', connected ? 'browser: connected' : 'browser: DISCONNECTED');
-    if (connected) {
-      notify?.(`Browser extension bridge reconnected (${probe.url || 'ws://127.0.0.1:7878'}).`, 'info');
-    } else {
-      notify?.(
-        `Browser extension bridge disconnected${probe.lastBridgeDisconnectReason ? `: ${probe.lastBridgeDisconnectReason}` : ''}. `
-        + 'pi keeps retrying automatically; if browser tools stay unavailable, reload the "Browser Agent" extension at chrome://extensions.',
-        'warning',
-      );
-    }
   });
 }
 
@@ -370,24 +305,24 @@ export default async function piBrowserAgentExtension(pi: {
   registerTool: (tool: any) => void;
 }) {
   const registerSessionTool = async (ctx?: ExtensionContextLike) => {
-    const sessionGeneration = sessionLifecycleGeneration;
+    const sessionGeneration = ++sessionLifecycleGeneration;
+    for (const cleanup of [...sessionCleanups]) cleanup();
+    sessionCleanups.clear();
+    for (const handle of activeHandles) handle.dispose();
+    activeHandles.clear();
     resetBrowserAgentToolState();
     resetRegisteredBrowserTools();
-    const logger = createUiLogger(ctx);
+    const logger = quietBrokerLogger;
+    const health = new BrowserHealthReporter(ctx?.ui);
 
     // One subscription per (session, broker instance). Re-resolving the broker
     // must not stack duplicate reporters, and the previous broker's must go.
     let attachedBroker: BrowserAgentBrokerLike | null = null;
     let detachReporters: (() => void) | null = null;
     const attachReporters = (broker: BrowserAgentBrokerLike) => {
-      if (attachedBroker === broker) return;
+      if (disposed || attachedBroker === broker) return;
       detachReporters?.();
-      const detachBridge = attachBridgeStateReporter(broker, ctx);
-      const detachPromotion = attachPromotionReporter(broker, logger);
-      detachReporters = () => {
-        detachBridge();
-        detachPromotion();
-      };
+      detachReporters = attachPromotionReporter(broker, logger);
       attachedBroker = broker;
     };
 
@@ -412,7 +347,40 @@ export default async function piBrowserAgentExtension(pi: {
       return broker as unknown as BrokerLike;
     }, taskStore);
     activeHandles.add(handle);
+    let disposed = false;
+    let recovering = false;
+    let observedResumeGeneration = resumeGeneration;
+    // Polling also covers initial state, lost proxy transports and stop/start
+    // cycles, none of which reliably emit bridge-state events.
+    const observeHealth = () => {
+      if (disposed || suspending) return;
+      if (observedResumeGeneration !== resumeGeneration) {
+        observedResumeGeneration = resumeGeneration;
+        health.resume();
+        // stop() clears broker listeners. Resume may reuse that same object.
+        const previousBroker = attachedBroker;
+        attachedBroker = null;
+        if (previousBroker) attachReporters(previousBroker);
+      }
+      health.observe(handle.probeConnectivity().bridgeConnected);
+    };
+    const recoveryTimer = setInterval(() => {
+      if (disposed || suspending || brokerShuttingDown) return;
+      observeHealth();
+      if (recovering) return;
+      recovering = true;
+      void handle.ensureReady({ waitForBridgeMs: 0 }).catch(() => {
+        // Tool diagnostics retain the cause; no raw exception reaches the UI.
+      }).finally(() => {
+        recovering = false;
+        observeHealth();
+      });
+    }, 2_000);
+    recoveryTimer.unref();
     sessionCleanups.add(() => {
+      disposed = true;
+      clearInterval(recoveryTimer);
+      health.dispose();
       detachReporters?.();
       detachReporters = null;
       attachedBroker = null;
@@ -431,11 +399,8 @@ export default async function piBrowserAgentExtension(pi: {
       startupMessage = null;
     } catch (error) {
       startupMessage = error instanceof Error ? error.message : String(error);
-      ctx?.ui?.notify?.(
-        `Browser agent broker not acquired yet: ${startupMessage}. Browser tools are registered and will retry automatically.`,
-        'warning',
-      );
     }
+    observeHealth();
   };
 
   // Install once per process so Ctrl+Z releases the broker port instead of
@@ -471,15 +436,13 @@ export default async function piBrowserAgentExtension(pi: {
     startupMessage = null;
     try {
       if (broker) await broker.stop();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ctx?.ui?.notify?.(`pi-browser-agent shutdown failed: ${message}`, 'warning');
+    } catch {
+      ctx?.ui?.notify?.('Browser broker cleanup failed.', 'warning');
     } finally {
       try {
         await removeInstanceFile(process.pid);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        ctx?.ui?.notify?.(`pi-browser-agent instance cleanup failed: ${message}`, 'warning');
+      } catch {
+        ctx?.ui?.notify?.('Browser discovery cleanup failed.', 'warning');
       }
       brokerShuttingDown = false;
     }

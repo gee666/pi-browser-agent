@@ -44,6 +44,7 @@ export class RemoteBrowserAgentBroker {
   readonly taskStore: TaskStore;
 
   private socket: WebSocket | null = null;
+  private validatedSocket: WebSocket | null = null;
   private connectPromise: Promise<void> | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private startupError: Error | null = null;
@@ -237,11 +238,15 @@ export class RemoteBrowserAgentBroker {
     }
   }
 
-  private closeSocket(): void {
+  private closeSocket(terminate = false): void {
     const socket = this.socket;
     this.socket = null;
+    this.validatedSocket = null;
     if (socket) {
-      try { socket.close(); } catch { /* ignore */ }
+      try {
+        if (terminate) socket.terminate();
+        else socket.close();
+      } catch { /* ignore */ }
     }
   }
 
@@ -327,7 +332,7 @@ export class RemoteBrowserAgentBroker {
       // socket to the primary is gone; otherwise tools happily send requests
       // into a dead proxy and only fail on timeout, and callers cannot tell
       // "healed" from "still using a stale snapshot".
-      const proxyAlive = !!this.socket && !this.startupError;
+      const proxyAlive = this.hasValidatedConnection();
       return {
         ...primary,
         brokerReachable: proxyAlive && primary.brokerReachable,
@@ -339,8 +344,8 @@ export class RemoteBrowserAgentBroker {
       };
     }
     return {
-      brokerReachable: !this.startupError && !!this.socket,
-      brokerListening: !this.startupError && !!this.socket,
+      brokerReachable: this.hasValidatedConnection(),
+      brokerListening: this.hasValidatedConnection(),
       bridgeConnected: false,
       startupError: this.startupError?.message,
       url: this.url,
@@ -349,7 +354,14 @@ export class RemoteBrowserAgentBroker {
     };
   }
 
+  private hasValidatedConnection(): boolean {
+    return !!this.socket && this.socket === this.validatedSocket
+      && this.socket.readyState === WebSocket.OPEN && !this.startupError;
+  }
+
   private async probePrimary(): Promise<ProbeResult> {
+    await this.ensureConnected();
+    const socket = this.socket;
     const response = await this.sendControlRequest('probe');
     if (!response.ok) {
       throw new Error(response.error?.message || 'Primary broker probe failed');
@@ -361,6 +373,10 @@ export class RemoteBrowserAgentBroker {
     if (data.supportsBrokerProxy !== true) {
       throw new Error(`Port ${this.port} has an old pi-browser-agent broker; restart the first pi instance`);
     }
+    if (this.stopped || this.socket !== socket || socket?.readyState !== WebSocket.OPEN) {
+      throw new Error('E_BRIDGE_DISCONNECTED');
+    }
+    this.validatedSocket = socket;
     return data as ProbeResult;
   }
 
@@ -471,7 +487,7 @@ export class RemoteBrowserAgentBroker {
     if (this.stopped) return;
     this.logger.warn?.('[pi-browser-agent] lost primary broker; healing', { reason });
     const promoted = await this.promoteOrReconnect();
-    if (promoted || this.socket) {
+    if (promoted || this.hasValidatedConnection()) {
       this.healAttempt = 0;
       this.cancelHealTimer();
       return;
@@ -551,6 +567,12 @@ export class RemoteBrowserAgentBroker {
           this.remoteProbe = await this.probePrimary();
           this.startupError = null;
         } catch (reconnectError) {
+          this.startupError = reconnectError instanceof Error ? reconnectError : new Error(String(reconnectError));
+          // A WebSocket handshake alone does not identify a broker. Discard
+          // failed probes immediately rather than waiting for a close handshake.
+          this.closeSocket(true);
+          this.rejectPendingRequests(this.startupError);
+          this.scheduleHeal();
           this.logger.warn?.('[pi-browser-agent] failed to reconnect to promoted primary broker', reconnectError);
         }
         return null;

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -791,6 +791,64 @@ test('a secondary heals itself in the background when the primary dies, with no 
 
   await remote.stop();
 });
+
+for (const failure of ['invalid', 'silent'] as const) {
+  test(`background recovery closes connections with ${failure} probes and keeps retrying`, async () => {
+    const port = await getFreePort();
+    const server = new WebSocketServer({ host: '127.0.0.1', port });
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    let valid = true;
+    let failedProbes = 0;
+    server.on('connection', (socket) => {
+      socket.on('message', (raw) => {
+        const frame = JSON.parse(raw.toString());
+        if (frame.kind !== 'probe') return;
+        if (!valid) {
+          failedProbes += 1;
+          if (failure === 'silent') return;
+        }
+        socket.send(JSON.stringify({
+          v: 1, kind: 'response', id: frame.id, ok: true,
+          data: valid ? {
+            brokerReachable: true, brokerListening: true, bridgeConnected: true,
+            supportsBrokerProxy: true, bridgeSessionSerial: 1,
+          } : { notABroker: true },
+        }));
+      });
+    });
+    const tmp = join(process.cwd(), 'tmp');
+    await mkdir(tmp, { recursive: true });
+    const root = await mkdtemp(join(tmp, 'broker-invalid-probe-'));
+    const remote = new RemoteBrowserAgentBroker({
+      host: '127.0.0.1', port,
+      logger: { info() {}, warn() {}, error() {} },
+      requestTimeoutMs: 100,
+      taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+    });
+    try {
+      await remote.start();
+      assert.equal(remote.probeConnectivity().bridgeConnected, true);
+      valid = false;
+      for (const socket of server.clients) socket.terminate();
+
+      await waitFor(() => failedProbes >= 1 && server.clients.size === 0, 2_000, 'failed connection cleanup');
+      assert.equal(remote.probeConnectivity().brokerListening, false);
+      assert.equal(remote.probeConnectivity().bridgeConnected, false);
+      await waitFor(() => failedProbes >= 2 && server.clients.size === 0, 3_000, 'background retry cleanup');
+
+      // No foreground call should be needed once a valid primary is available.
+      valid = true;
+      await waitFor(() => remote.probeConnectivity().bridgeConnected, 4_000, 'validated reconnect');
+      assert.equal(remote.probeConnectivity().role, 'proxy');
+      assert.equal(remote.probeConnectivity().startupError, undefined);
+    } finally {
+      await remote.stop();
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test('a proxy secondary never claims a live bridge once its socket to the primary is gone', async () => {
   const port = await getFreePort();

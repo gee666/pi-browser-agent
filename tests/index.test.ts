@@ -145,7 +145,7 @@ test('extension retries broker startup on a later session after a transient bind
   }
 });
 
-test('broker startup diagnostics are routed through the extension UI context', async () => {
+test('startup failure stays quiet and retries without a tool call', async () => {
   await resetForTests();
   const originalPort = process.env.PI_BA_PORT;
   const originalRange = process.env.PI_BA_PORT_RANGE;
@@ -153,6 +153,7 @@ test('broker startup diagnostics are routed through the extension UI context', a
   const blockedPort = await getFreePort();
   const blocker = net.createServer();
   const notifications: Array<{ message: string; type?: string }> = [];
+  const statuses: Array<string | undefined> = [];
 
   try {
     await new Promise<void>((resolve, reject) => blocker.listen(blockedPort, '127.0.0.1', () => resolve()).once('error', reject));
@@ -164,17 +165,26 @@ test('broker startup diagnostics are routed through the extension UI context', a
     await extension(pi as any);
     const sessionStart = pi.handlers.get('session_start');
 
-    await sessionStart({}, { ui: { notify: (message: string, type?: string) => notifications.push({ message, type }) } });
+    await sessionStart({}, { ui: {
+      notify: (message: string, type?: string) => notifications.push({ message, type }),
+      setStatus: (_key: string, status: string | undefined) => statuses.push(status),
+    } });
 
     assert.equal(getBroker(), null);
-    assert.ok(notifications.some((entry) => entry.type === 'warning' && entry.message.includes('primary broker port is busy')));
-    // Startup failure is no longer fatal for the session: the user is warned,
-    // and the full browser_* suite is still registered behind a lazy handle so
-    // the integration can heal itself on a later tool call without restarting pi.
-    assert.ok(notifications.some((entry) => entry.type === 'warning' && entry.message.includes('Browser agent broker not acquired yet')));
+    assert.deepEqual(notifications, []);
+    assert.deepEqual(statuses, ['browser: recovering']);
     assert.ok(pi.tools.has('activate_browser_agent_tools'));
     assert.ok(pi.tools.has('browser_get_html'));
     assert.ok(pi.tools.has('browser_run_task'));
+    await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    const deadline = Date.now() + 5_000;
+    while (!getBroker() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(getBroker()?.probeConnectivity().brokerListening, true);
+    assert.deepEqual(notifications, []);
+    await pi.handlers.get('session_shutdown')({}, {});
+    assert.equal(statuses.at(-1), undefined);
   } finally {
     await resetForTests();
     await new Promise<void>((resolve) => blocker.close(() => resolve()));
@@ -193,6 +203,54 @@ test('broker startup diagnostics are routed through the extension UI context', a
     } else {
       process.env.PI_BA_NO_EPHEMERAL = originalNoEph;
     }
+  }
+});
+
+test('session monitor reports one warning per outage and stops on shutdown', async (t) => {
+  await resetForTests();
+  const originalPort = process.env.PI_BA_PORT;
+  const notifications: string[] = [];
+  const statuses: Array<string | undefined> = [];
+  try {
+    process.env.PI_BA_PORT = String(await getFreePort());
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: 0 });
+    const pi = createPiHarness();
+    await extension(pi as any);
+    await pi.handlers.get('session_start')({}, { ui: {
+      notify: (message: string) => notifications.push(message),
+      setStatus: (_key: string, status: string | undefined) => statuses.push(status),
+    } });
+    const broker = getBroker()!;
+    const initial = broker.probeConnectivity();
+    let connected = false;
+    t.mock.method(broker, 'probeConnectivity', () => ({ ...initial, bridgeConnected: connected }));
+    const ready = t.mock.method(broker, 'ensureReady', async () => {});
+    t.mock.timers.tick(60_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(notifications.length, 1);
+    assert.equal(statuses.at(-1), 'browser: disconnected');
+    t.mock.timers.tick(60_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(notifications.length, 1);
+    connected = true;
+    t.mock.timers.tick(2_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(statuses.at(-1), 'browser: connected');
+    assert.equal(notifications.length, 1, 'recovery is silent');
+    const calls = ready.mock.callCount();
+    t.mock.timers.tick(2_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(ready.mock.callCount() > calls, 'healthy connections are still validated');
+    await pi.handlers.get('session_shutdown')({}, {});
+    const stoppedCalls = ready.mock.callCount();
+    t.mock.timers.tick(120_000);
+    assert.equal(ready.mock.callCount(), stoppedCalls);
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(notifications.length, 1);
+  } finally {
+    await resetForTests();
+    if (originalPort === undefined) delete process.env.PI_BA_PORT;
+    else process.env.PI_BA_PORT = originalPort;
   }
 });
 
