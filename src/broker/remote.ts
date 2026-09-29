@@ -237,16 +237,20 @@ export class RemoteBrowserAgentBroker {
     }
   }
 
-  async stop(): Promise<void> {
-    this.stopped = true;
-    this.cancelHealTimer();
-    this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
-    const connecting = this.connectPromise;
+  private closeSocket(): void {
     const socket = this.socket;
     this.socket = null;
     if (socket) {
       try { socket.close(); } catch { /* ignore */ }
     }
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.cancelHealTimer();
+    this.rejectPendingRequests(new Error('E_BRIDGE_DISCONNECTED'));
+    const connecting = this.connectPromise;
+    this.closeSocket();
     // A connect or promotion already in flight can otherwise publish a socket
     // or listener after stop() returns. Their completion paths observe
     // `stopped` and tear down instead of publishing.
@@ -258,11 +262,8 @@ export class RemoteBrowserAgentBroker {
     if (promotion) {
       try { await promotion; } catch { /* promotion failure is already logged */ }
     }
-    const lateSocket = this.socket;
-    this.socket = null;
-    if (lateSocket) {
-      try { lateSocket.close(); } catch { /* ignore */ }
-    }
+    // Read the socket again after async work, which may have replaced it.
+    this.closeSocket();
     this.unsubscribePromoted?.();
     this.unsubscribePromoted = null;
     this.bridgeStateListeners.clear();

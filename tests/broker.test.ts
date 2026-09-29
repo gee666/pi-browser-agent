@@ -189,8 +189,11 @@ test('remote broker proxies requests through the primary broker bridge', async (
 
   const response = await remote.request('browser_list_tabs', { activeOnly: false });
   assert.equal(response.ok, true);
-  assert.equal(response.data?.proxied, true);
-  assert.equal(response.data?.type, 'browser_list_tabs');
+  assert.deepEqual(response.data, {
+    proxied: true,
+    type: 'browser_list_tabs',
+    params: { activeOnly: false },
+  });
 
   await remote.stop();
   bridge.close();
@@ -341,7 +344,7 @@ test('remote broker promotes itself when the primary broker exits', async () => 
 
   const response = await remote.request('browser_list_tabs', {});
   assert.equal(response.ok, true);
-  assert.equal(response.data?.promoted, true);
+  assert.deepEqual(response.data, { promoted: true });
 
   bridge.close();
   await remote.stop();
@@ -478,7 +481,7 @@ test('with many secondaries, exactly one promotes when the primary stops and all
   const results = await Promise.all(remotes.map((r) => r.request('browser_list_tabs', {})));
   for (const response of results) {
     assert.equal(response.ok, true);
-    assert.equal(response.data?.served, true);
+    assert.deepEqual(response.data, { served: true });
   }
 
   bridge.close();
@@ -868,6 +871,44 @@ test('ensureReady() rebind leaves exactly one heartbeat interval running', async
     globalThis.clearInterval = realClearInterval;
     bridge?.close();
     await broker.stop();
+  }
+});
+
+test('remote stop() rejects a pending proxy request and does not reconnect', async () => {
+  const port = await getFreePort();
+  const primary = await createBroker(port);
+  await primary.start();
+  const bridge = await connectBridge(port, 'ext-stop-proxy');
+
+  const root = await mkdtemp(join(tmpdir(), 'pi-browser-agent-stop-proxy-'));
+  const remote = new RemoteBrowserAgentBroker({
+    host: '127.0.0.1',
+    port,
+    logger: { info() {}, warn() {}, error() {} },
+    requestTimeoutMs: 2_000,
+    taskStore: new TaskStore({ dir: join(root, 'tasks') }),
+  });
+
+  try {
+    await remote.start();
+    const received = new Promise<void>((resolve) => bridge.once('message', () => resolve()));
+    const rejected = assert.rejects(
+      remote.request('browser_list_tabs', {}),
+      /E_BRIDGE_DISCONNECTED/,
+    );
+    await received;
+    await remote.stop();
+    await rejected;
+
+    await remote.ensureReady({ waitForBridgeMs: 0 });
+    assert.equal(remote.probeConnectivity().brokerListening, false);
+    assert.equal(remote.probeConnectivity().bridgeConnected, false);
+    await assert.rejects(() => remote.request('browser_list_tabs', {}), /E_BRIDGE_DISCONNECTED/);
+    assert.equal(primary.probeConnectivity().brokerListening, true);
+  } finally {
+    bridge.close();
+    await remote.stop();
+    await primary.stop();
   }
 });
 

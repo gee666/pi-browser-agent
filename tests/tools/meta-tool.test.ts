@@ -120,5 +120,6 @@ test('meta-tool reports ready status when broker + bridge are healthy and remain
   assert.equal(probes, 3);
   assert.ok(Array.isArray(first.details.registeredTools));
   assert.ok(first.details.registeredTools.includes('browser_run_task'));
+  assert.ok(Array.isArray(third.details.registeredTools));
   assert.ok(third.details.registeredTools.includes('browser_run_task'));
 });

@@ -175,7 +175,8 @@ test('browser_run_task forwards an explicit tab_id instead of selecting the acti
 test('concurrent browser_run_task attempts return E_BUSY without crashing the caller', async () => {
   const { broker } = await createBroker();
   let activeRunId: string | null = null;
-  let activeSocket: WebSocket | null = null;
+  let requestEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { requestEntered = resolve; });
 
   const socket = await connectBridge(broker, async (frame, ws) => {
     if (frame.type !== 'browser_run_task') return;
@@ -194,13 +195,13 @@ test('concurrent browser_run_task attempts return E_BUSY without crashing the ca
     }
 
     activeRunId = frame.id;
-    activeSocket = ws;
+    requestEntered();
   });
   const tools = createToolHarness(broker);
 
   try {
     const firstRun = tools.get('browser_run_task').execute('call-1', { task: 'Task one' });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await entered;
 
     const secondRun = await tools.get('browser_run_task').execute('call-2', { task: 'Task two' });
     assert.equal(secondRun.details.ok, false);
@@ -208,7 +209,7 @@ test('concurrent browser_run_task attempts return E_BUSY without crashing the ca
     assert.match(textOf(secondRun), /rejected/i);
 
     assert.ok(activeRunId);
-    activeSocket?.send(JSON.stringify({
+    socket.send(JSON.stringify({
       v: 1,
       kind: 'response',
       id: activeRunId,
