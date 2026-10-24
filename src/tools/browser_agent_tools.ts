@@ -2,6 +2,7 @@ import { Type } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import { formatBridgeFailure } from '../broker/diagnostics.ts';
+import { ABORT_ERROR_CODE } from '../broker/abort.ts';
 import { getPlaceholderBrowserToolSpecs } from './_register.ts';
 
 export function resetBrowserAgentToolState(): void {
@@ -45,13 +46,21 @@ export function createBrowserAgentToolsTool(
       'Diagnose and repair the browser integration. Forces a lazy re-acquire of the broker port (promoting this pi process to primary if the previous owner died) and waits for the Chrome extension bridge to reconnect. Call this whenever a browser_* tool reports E_BRIDGE_DISCONNECTED; it returns the full connectivity state plus recovery steps.',
     promptSnippet: 'Diagnose and repair the browser integration for this session.',
     parameters: Type.Object({}),
-    async execute(_toolCallId: string, _params: Record<string, unknown>) {
+    async execute(_toolCallId: string, _params: Record<string, unknown>, signal?: AbortSignal) {
       // Lazily (re)acquire the broker so a killed primary is replaced on demand
       // when someone actually asks for the browser tools. Only do this for the
       // lifecycle-managed singleton — never for the throwaway fallback broker,
       // which is not tracked for shutdown and must not leak a listener.
+      // This call waits out the bridge reconnect window, so it must honour
+      // Escape too.
       if (managed) {
-        await broker.ensureReady?.();
+        await broker.ensureReady?.({ signal });
+      }
+      if (signal?.aborted) {
+        return {
+          content: [{ type: 'text', text: 'activate_browser_agent_tools cancelled before completing.' }],
+          details: { ok: false, cancelled: true, error: { code: ABORT_ERROR_CODE, message: 'Request cancelled' } },
+        };
       }
       const probe = broker.probeConnectivity();
       if (!probe.brokerReachable || !probe.brokerListening || !probe.bridgeConnected) {

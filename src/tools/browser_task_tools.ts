@@ -6,6 +6,7 @@ import type { BrowserAgentBroker } from '../broker/server.ts';
 import type { ResponseFrame } from '../broker/protocol.ts';
 import { formatBridgeFailure } from '../broker/diagnostics.ts';
 import { assertValidTaskId, TaskCorruptionError, type TaskStoreEntry } from '../broker/task-store.ts';
+import { ABORT_ERROR_CODE, isAbortError } from '../broker/abort.ts';
 
 interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -206,10 +207,20 @@ export function createBrowserRunTaskTool(broker: BrowserAgentBroker) {
     async execute(
       _toolCallId: string,
       params: { task: string; tab_id?: number; use_active_tab?: boolean; debugMode?: boolean; timeoutMs?: number },
+      signal?: AbortSignal,
     ): Promise<ToolResult> {
       // Lazily (re)acquire the broker so a killed primary is replaced on demand,
       // and wait out the extension's reconnect window before deciding we are down.
-      await broker.ensureReady?.();
+      await broker.ensureReady?.({ signal });
+      if (signal?.aborted) {
+        return textResult('browser_run_task cancelled before the task was started.', {
+          ok: false,
+          success: false,
+          cancelled: true,
+          status: 'cancelled',
+          error: { code: ABORT_ERROR_CODE, message: 'Request cancelled' },
+        });
+      }
       const probe = broker.probeConnectivity();
 
       // Fail fast with actionable diagnostics rather than recording a task that
@@ -251,25 +262,37 @@ export function createBrowserRunTaskTool(broker: BrowserAgentBroker) {
         response = await broker.request(
           'browser_run_task',
           request,
-          { timeoutMs: params.timeoutMs ?? 5 * 60 * 1000 },
+          { timeoutMs: params.timeoutMs ?? 5 * 60 * 1000, signal },
         );
       } catch (error) {
         const errorInfo = errorInfoFromUnknown(error);
-        const history = await finishRecordedTask(broker, taskId, 'error', {
+        // Escape on a task used to hold pi for the full 5-minute budget. We now
+        // stop waiting immediately; the browser-side run is still in flight, so
+        // the recorded status says cancelled rather than failed and the task id
+        // remains queryable via browser_get_task_history.
+        const cancelled = isAbortError(error);
+        const status = cancelled ? 'cancelled' : 'error';
+        const history = await finishRecordedTask(broker, taskId, status, {
           error: errorInfo,
           bridge: { connected: broker.probeConnectivity().bridgeConnected },
         });
-        return textResult(formatResponseText(taskId, 'error', errorInfo.message), {
-          ok: false,
-          success: false,
-          taskId,
-          status: 'error',
-          error: errorInfo,
-          probe,
-          history,
-          summary: summarizeHistory(taskId, history),
-          historySummary: null,
-        });
+        return textResult(
+          cancelled
+            ? `Browser task ${taskId} cancelled: pi stopped waiting for it. The browser may still be running it; check browser_get_task_history for the outcome.`
+            : formatResponseText(taskId, 'error', errorInfo.message),
+          {
+            ok: false,
+            success: false,
+            cancelled: cancelled || undefined,
+            taskId,
+            status,
+            error: errorInfo,
+            probe,
+            history,
+            summary: summarizeHistory(taskId, history),
+            historySummary: null,
+          },
+        );
       }
 
       if (!response.ok) {

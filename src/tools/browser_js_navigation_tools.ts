@@ -4,6 +4,7 @@ import type { ProbeResult } from '../broker/protocol.ts';
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import { formatBridgeFailure } from '../broker/diagnostics.ts';
 import { truncateAndSpill } from '../util/truncate.ts';
+import { abortError, isAbortError, sleepUnlessAborted } from '../broker/abort.ts';
 
 interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -36,18 +37,22 @@ async function brokerToolRequest(
   type: string,
   params: unknown,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<{ ok: true; data: unknown } | { ok: false; error: { code: string; message: string; details?: unknown } }> {
   try {
+    // Cancellation can arrive before we touch the broker at all.
+    if (signal?.aborted) throw abortError(type, signal);
     // Lazily (re)acquire the broker (and wait out the extension's reconnect
     // window) so a killed primary or a bounced service worker is healed on
     // demand instead of failing the call.
-    await broker.ensureReady?.();
+    await broker.ensureReady?.({ signal });
+    if (signal?.aborted) throw abortError(type, signal);
     const probe = broker.probeConnectivity();
     if (!probe.brokerListening || !probe.bridgeConnected) {
       const { text, diagnostics } = formatBridgeFailure(probe, type);
       return { ok: false, error: { code: 'E_BRIDGE_DISCONNECTED', message: text, details: { probe, diagnostics } } };
     }
-    const response = await broker.request(type, params, { timeoutMs });
+    const response = await broker.request(type, params, { timeoutMs, signal });
     if (!response.ok) {
       return {
         ok: false,
@@ -62,6 +67,15 @@ async function brokerToolRequest(
   } catch (error) {
     return { ok: false, error: errorInfoFromUnknown(error) };
   }
+}
+
+/** Cancellation is a normal outcome, not a malfunction — say so plainly so the
+ *  agent does not start diagnosing a broken browser after the user hit Escape. */
+function formatFailureText(name: string, error: { code: string; message: string }): string {
+  if (error.code === 'E_ABORTED') {
+    return `${name} cancelled: ${error.message}`;
+  }
+  return `${name} failed: ${error.message}`;
 }
 
 async function formatPayload(payload: unknown, ext: 'txt' | 'json' = 'json') {
@@ -162,11 +176,17 @@ function validateSuccessPayload(name: string, data: any): { code: string; messag
   return null;
 }
 
-async function waitForBridgeSessionChange(broker: BrowserAgentBroker, beforeProbe: ProbeResult, timeoutMs: number): Promise<ProbeResult> {
+async function waitForBridgeSessionChange(
+  broker: BrowserAgentBroker,
+  beforeProbe: ProbeResult,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<ProbeResult> {
   const deadline = Date.now() + timeoutMs;
   let lastProbe = broker.probeConnectivity();
 
   while (Date.now() < deadline) {
+    if (signal?.aborted) throw abortError('browser_reload_extension', signal);
     lastProbe = broker.probeConnectivity();
     if (
       lastProbe.bridgeConnected
@@ -176,7 +196,7 @@ async function waitForBridgeSessionChange(broker: BrowserAgentBroker, beforeProb
     ) {
       return lastProbe;
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await sleepUnlessAborted(100, signal);
   }
 
   throw {
@@ -203,7 +223,14 @@ function createRequestTool(options: {
     description: createToolDescription(options.description),
     promptSnippet: options.promptSnippet,
     parameters: options.parameters,
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResult> {
+    // `signal` is pi's cancellation handle (Escape). Accepting it here is what
+    // lets an aborted call return at once instead of blocking until the
+    // per-tool timeout (15s eval / 30s run_js / navigation budgets) expires.
+    async execute(
+      _toolCallId: string,
+      params: Record<string, unknown>,
+      signal?: AbortSignal,
+    ): Promise<ToolResult> {
       const requestParams = options.name === 'browser_clear_site_data'
         ? withClearSiteDataTarget(params)
         : [
@@ -215,10 +242,17 @@ function createRequestTool(options: {
           ? withDefaultActiveTabTarget(params)
           : params;
 
-      const outcome = await brokerToolRequest(broker, options.name, requestParams, options.timeoutFromParams(requestParams));
+      const outcome = await brokerToolRequest(
+        broker,
+        options.name,
+        requestParams,
+        options.timeoutFromParams(requestParams),
+        signal,
+      );
       if (!outcome.ok) {
-        return textResult(`${options.name} failed: ${outcome.error.message}`, {
+        return textResult(formatFailureText(options.name, outcome.error), {
           ok: false,
+          cancelled: outcome.error.code === 'E_ABORTED' || undefined,
           error: outcome.error,
           request: requestParams,
         });
@@ -432,13 +466,18 @@ export function createBrowserReloadExtensionTool(broker: BrowserAgentBroker) {
     description: createToolDescription(browserReloadExtensionDefinition.description),
     promptSnippet: browserReloadExtensionDefinition.promptSnippet,
     parameters: browserReloadExtensionDefinition.parameters,
-    async execute(_toolCallId: string, params: { timeout_ms?: number }): Promise<ToolResult> {
+    async execute(
+      _toolCallId: string,
+      params: { timeout_ms?: number },
+      signal?: AbortSignal,
+    ): Promise<ToolResult> {
       const timeoutMs = Number(params.timeout_ms ?? 15_000);
       const beforeProbe = broker.probeConnectivity();
-      const outcome = await brokerToolRequest(broker, 'browser_reload_extension', params, timeoutMs);
+      const outcome = await brokerToolRequest(broker, 'browser_reload_extension', params, timeoutMs, signal);
       if (!outcome.ok) {
-        return textResult('browser_reload_extension failed: ' + outcome.error.message, {
+        return textResult(formatFailureText('browser_reload_extension', outcome.error), {
           ok: false,
+          cancelled: outcome.error.code === 'E_ABORTED' || undefined,
           error: outcome.error,
           request: params,
           probeBefore: beforeProbe,
@@ -446,7 +485,7 @@ export function createBrowserReloadExtensionTool(broker: BrowserAgentBroker) {
       }
 
       try {
-        const afterProbe = await waitForBridgeSessionChange(broker, beforeProbe, timeoutMs);
+        const afterProbe = await waitForBridgeSessionChange(broker, beforeProbe, timeoutMs, signal);
         const data = { ...(outcome.data as Record<string, unknown>), reconnected: true };
         const protocolError = validateSuccessPayload('browser_reload_extension', data);
         if (protocolError) {
@@ -471,8 +510,9 @@ export function createBrowserReloadExtensionTool(broker: BrowserAgentBroker) {
         });
       } catch (error) {
         const errorInfo = errorInfoFromUnknown(error);
-        return textResult('browser_reload_extension failed: ' + errorInfo.message, {
+        return textResult(formatFailureText('browser_reload_extension', errorInfo), {
           ok: false,
+          cancelled: isAbortError(error) || undefined,
           error: errorInfo,
           request: params,
           result: outcome.data,

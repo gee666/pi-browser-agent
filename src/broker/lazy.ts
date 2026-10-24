@@ -1,12 +1,13 @@
 import type { ProbeResult, ResponseFrame } from './protocol.ts';
 import type { EnsureReadyOptions } from './server.ts';
 import type { TaskStore } from './task-store.ts';
+import type { BrokerRequestOptions } from './abort.ts';
 
 /** The slice of the broker API that the browser_* tools actually consume. */
 export interface BrokerLike {
   ensureReady?: (options?: EnsureReadyOptions) => Promise<void>;
   probeConnectivity: () => ProbeResult;
-  request: (type: string, params: unknown, options?: { timeoutMs?: number }) => Promise<ResponseFrame>;
+  request: (type: string, params: unknown, options?: BrokerRequestOptions) => Promise<ResponseFrame>;
   taskStore: TaskStore;
 }
 
@@ -139,7 +140,7 @@ export class LazyBrokerHandle implements BrokerLike {
     return probe;
   }
 
-  async request(type: string, params: unknown, options: { timeoutMs?: number } = {}): Promise<ResponseFrame> {
+  async request(type: string, params: unknown, options: BrokerRequestOptions = {}): Promise<ResponseFrame> {
     if (this.disposed) {
       throw new Error('E_BRIDGE_DISCONNECTED');
     }

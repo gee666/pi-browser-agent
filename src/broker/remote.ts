@@ -19,6 +19,13 @@ import {
   type BrokerLogger,
   type EnsureReadyOptions,
 } from './server.ts';
+import {
+  abortError,
+  onAbort,
+  sleepUnlessAborted,
+  throwIfAborted,
+  type BrokerRequestOptions,
+} from './abort.ts';
 
 interface PendingRequest {
   resolve: (value: ResponseFrame) => void;
@@ -136,7 +143,7 @@ export class RemoteBrowserAgentBroker {
     // Poll the primary's probe for the same budget a local broker would wait,
     // so a tool call arriving during a reconnect window succeeds instead of
     // reporting a hard "connection is down".
-    await this.waitForRemoteBridge(options.waitForBridgeMs ?? this.defaultRemoteBridgeWaitMs());
+    await this.waitForRemoteBridge(options.waitForBridgeMs ?? this.defaultRemoteBridgeWaitMs(), options.signal);
   }
 
   /** Full budget only when the primary has actually seen a bridge at some point.
@@ -149,13 +156,13 @@ export class RemoteBrowserAgentBroker {
     return this.remoteProbe?.bridgeEverConnected === false ? COLD_BRIDGE_WAIT_MS : DEFAULT_BRIDGE_WAIT_MS;
   }
 
-  private async waitForRemoteBridge(timeoutMs: number): Promise<boolean> {
+  private async waitForRemoteBridge(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
     if (this.probeConnectivity().bridgeConnected) {
       this.coldBridgeMisses = 0;
       this.coldBridgeSince = null;
       return true;
     }
-    if (timeoutMs <= 0) return false;
+    if (timeoutMs <= 0 || signal?.aborted) return false;
     const deadline = Date.now() + timeoutMs;
     // Every sub-step below can block for up to ~1.5s, so the budget is
     // re-checked before each of them. Checking only at the top of the loop let a
@@ -164,9 +171,10 @@ export class RemoteBrowserAgentBroker {
     while (Date.now() < deadline) {
       const sleepMs = Math.min(250, deadline - Date.now());
       if (sleepMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, sleepMs).unref?.());
+        // Wakes immediately on Escape instead of finishing the tick.
+        await sleepUnlessAborted(sleepMs, signal);
       }
-      if (this.stopped) return false;
+      if (this.stopped || signal?.aborted) return false;
       if (Date.now() >= deadline) break;
       try {
         await this.ensureConnected();
@@ -182,14 +190,15 @@ export class RemoteBrowserAgentBroker {
         if (Date.now() >= deadline) break;
         const promoted = await this.promoteOrReconnect();
         if (promoted) {
-          const found = await promoted.waitForBridge(Math.max(0, deadline - Date.now()));
-          this.recordBridgeWaitOutcome(found, timeoutMs);
+          const found = await promoted.waitForBridge(Math.max(0, deadline - Date.now()), signal);
+          if (!signal?.aborted) this.recordBridgeWaitOutcome(found, timeoutMs);
           return found;
         }
       }
     }
     const connected = this.probeConnectivity().bridgeConnected;
-    this.recordBridgeWaitOutcome(connected, timeoutMs);
+    // A budget cut short by Escape is not evidence that the browser is cold.
+    if (!signal?.aborted) this.recordBridgeWaitOutcome(connected, timeoutMs);
     return connected;
   }
 
@@ -280,8 +289,9 @@ export class RemoteBrowserAgentBroker {
     }
   }
 
-  async request(type: string, params: unknown, options: { timeoutMs?: number } = {}): Promise<ResponseFrame> {
+  async request(type: string, params: unknown, options: BrokerRequestOptions = {}): Promise<ResponseFrame> {
     if (this.stopped) throw new Error('E_BRIDGE_DISCONNECTED');
+    throwIfAborted(options.signal, type);
     if (this.promotedBroker) {
       return await this.promotedBroker.request(type, params, options);
     }
@@ -305,19 +315,34 @@ export class RemoteBrowserAgentBroker {
     const payload = JSON.stringify({ v: 1, kind: 'request', id, type, params });
 
     return await new Promise<ResponseFrame>((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      let releaseAbort = () => {};
+      const settle = (fn: () => void) => {
         this.pendingRequests.delete(id);
-        reject(new Error(`Request timed out: ${type}`));
+        clearTimeout(timeout);
+        releaseAbort();
+        fn();
+      };
+
+      const timeout = setTimeout(() => {
+        settle(() => reject(new Error(`Request timed out: ${type}`)));
       }, options.timeoutMs ?? this.requestTimeoutMs);
       timeout.unref?.();
 
-      this.pendingRequests.set(id, { resolve, reject, timeout });
+      this.pendingRequests.set(id, {
+        resolve: (frame) => settle(() => resolve(frame)),
+        reject: (error) => settle(() => reject(error)),
+        timeout,
+      });
+
+      releaseAbort = onAbort(options.signal, () => {
+        settle(() => reject(abortError(type, options.signal)));
+      });
+      if (options.signal?.aborted) return;
+
       try {
         socket.send(payload);
       } catch (error) {
-        clearTimeout(timeout);
-        this.pendingRequests.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        settle(() => reject(error instanceof Error ? error : new Error(String(error))));
       }
     });
   }

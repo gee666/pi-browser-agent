@@ -16,6 +16,13 @@ import {
   type ResponseFrame,
 } from './protocol.ts';
 import { TaskStore } from './task-store.ts';
+import {
+  abortError,
+  onAbort,
+  throwIfAborted,
+  type BrokerRequestOptions,
+  type AbortableOptions,
+} from './abort.ts';
 
 export interface BrokerLogger {
   info?: (...args: unknown[]) => void;
@@ -67,7 +74,7 @@ export interface BridgeStateEvent {
 
 export type BridgeStateListener = (state: BridgeStateEvent) => void;
 
-export interface EnsureReadyOptions {
+export interface EnsureReadyOptions extends AbortableOptions {
   /** Override the bridge wait budget. 0 disables waiting entirely. */
   waitForBridgeMs?: number;
 }
@@ -258,8 +265,12 @@ export class BrowserAgentBroker {
     //    failing a tool call that arrived mid-reconnect. This is what makes the
     //    integration self-healing from the agent's point of view.
     const budget = this.resolveBridgeWaitMs(options);
-    const connected = await this.waitForBridge(budget);
-    this.recordBridgeWaitOutcome(connected, budget);
+    const connected = await this.waitForBridge(budget, options.signal);
+    // A wait cut short by Escape says nothing about whether the browser is
+    // cold, so it must not feed the cold-bridge memo.
+    if (!options.signal?.aborted) {
+      this.recordBridgeWaitOutcome(connected, budget);
+    }
   }
 
   /** Remember that the full budget was burned without a bridge showing up, so
@@ -308,23 +319,29 @@ export class BrowserAgentBroker {
   /** Resolve as soon as a Chrome extension bridge is connected, or after
    *  `timeoutMs`. Never rejects — callers decide what to do with a still-absent
    *  bridge. */
-  async waitForBridge(timeoutMs: number): Promise<boolean> {
+  async waitForBridge(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
     if (this.bridgeSocket && this.bridgeHello) return true;
+    if (signal?.aborted) return false;
     if (!this.server || timeoutMs <= 0) return false;
 
     return await new Promise<boolean>((resolve) => {
       let settled = false;
+      let releaseAbort = () => {};
       const finish = (value: boolean) => {
         if (settled) return;
         settled = true;
         this.bridgeWaiters.delete(waiter);
         clearTimeout(timer);
+        releaseAbort();
         resolve(value);
       };
       const waiter = (connected: boolean) => finish(connected);
       const timer = setTimeout(() => finish(!!this.bridgeSocket && !!this.bridgeHello), timeoutMs);
       timer.unref?.();
       this.bridgeWaiters.add(waiter);
+      // Waiting out an 8s reconnect window is the other place Escape used to
+      // hang, before any request is even sent.
+      releaseAbort = onAbort(signal, () => finish(false));
     });
   }
 
@@ -510,7 +527,10 @@ export class BrowserAgentBroker {
     });
   }
 
-  async request(type: string, params: unknown, options: { timeoutMs?: number } = {}): Promise<ResponseFrame> {
+  async request(type: string, params: unknown, options: BrokerRequestOptions = {}): Promise<ResponseFrame> {
+    // Never open a request for a caller that has already cancelled.
+    throwIfAborted(options.signal, type);
+
     const socket = this.bridgeSocket;
     if (!socket || !this.bridgeHello) {
       throw new Error('E_BRIDGE_DISCONNECTED');
@@ -520,29 +540,45 @@ export class BrowserAgentBroker {
     const payload = JSON.stringify({ v: 1, kind: 'request', id, type, params });
 
     return await new Promise<ResponseFrame>((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      let releaseAbort = () => {};
+      const settle = (fn: () => void) => {
         this.pendingRequests.delete(id);
-        reject(new Error(`Request timed out: ${type}`));
+        clearTimeout(timeout);
+        releaseAbort();
+        fn();
+      };
+
+      const timeout = setTimeout(() => {
+        settle(() => reject(new Error(`Request timed out: ${type}`)));
       }, options.timeoutMs ?? this.requestTimeoutMs);
       timeout.unref?.();
 
-      this.pendingRequests.set(id, { resolve, reject, timeout });
+      this.pendingRequests.set(id, {
+        resolve: (frame) => settle(() => resolve(frame)),
+        reject: (error) => settle(() => reject(error)),
+        timeout,
+      });
+
+      // Escape (or any other cancellation) hands pi back control immediately.
+      // The bridge has no cancel frame yet, so the in-flight browser work still
+      // finishes; we just stop waiting for it and drop the pending entry so a
+      // late response is ignored instead of resolving a dead promise.
+      releaseAbort = onAbort(options.signal, () => {
+        settle(() => reject(abortError(type, options.signal)));
+      });
+      if (options.signal?.aborted) return;
 
       // If the bridge went away between our validation and send, reject fast
       // so callers get a direct disconnect error instead of waiting for a timeout.
       if (this.bridgeSocket !== socket) {
-        clearTimeout(timeout);
-        this.pendingRequests.delete(id);
-        reject(new Error('E_BRIDGE_DISCONNECTED'));
+        settle(() => reject(new Error('E_BRIDGE_DISCONNECTED')));
         return;
       }
 
       try {
         socket.send(payload);
       } catch (error) {
-        clearTimeout(timeout);
-        this.pendingRequests.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        settle(() => reject(error instanceof Error ? error : new Error(String(error))));
       }
     });
   }

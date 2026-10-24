@@ -10,6 +10,7 @@ import type { BrowserAgentBroker } from '../../broker/server.ts';
 import type { ResponseFrame } from '../../broker/protocol.ts';
 import { formatBridgeFailure } from '../../broker/diagnostics.ts';
 import { truncateAndSpill } from '../../util/truncate.ts';
+import { abortError, isAbortError, type BrokerRequestOptions } from '../../broker/abort.ts';
 
 const SCREENSHOT_TEMP_DIR = join(tmpdir(), 'pi-browser-agent', 'screenshots');
 const SCREENSHOT_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -30,7 +31,8 @@ export interface ReadOnlyToolDefinition<TParams = Record<string, unknown>> {
   description: string;
   promptSnippet: string;
   parameters: TSchema;
-  execute: (toolCallId: string, params: TParams) => Promise<ToolResult>;
+  /** `signal` is pi's per-tool-call cancellation handle (Escape). */
+  execute: (toolCallId: string, params: TParams, signal?: AbortSignal) => Promise<ToolResult>;
 }
 
 export class BrowserReadOnlyToolError extends Error {
@@ -89,6 +91,15 @@ export function coerceError(error: unknown, fallbackCode = 'E_INTERNAL'): Browse
   return new BrowserReadOnlyToolError(normalizedCode, message);
 }
 
+/** Cancellation is a user action, not a failure: label it accordingly so the
+ *  agent does not chase a browser problem that does not exist. */
+export function formatToolFailureText(label: string, error: { code: string; message: string }): string {
+  if (isAbortError(error)) {
+    return `${label} cancelled: ${error.message}`;
+  }
+  return `${label} failed: ${error.message}`;
+}
+
 export function ensureBridgeConnected(broker: BrowserAgentBroker, toolName?: string): void {
   const probe = broker.probeConnectivity();
   if (probe.brokerListening && probe.bridgeConnected) {
@@ -104,13 +115,17 @@ export async function requestBridge<TData>(
   broker: BrowserAgentBroker,
   type: string,
   params: unknown,
-  options: { timeoutMs?: number } = {},
+  options: BrokerRequestOptions = {},
 ): Promise<{ response: ResponseFrame; data: TData }> {
+  const { signal } = options;
+  if (signal?.aborted) throw coerceError(abortError(type, signal));
   // Lazily (re)acquire the broker before the readiness check so a killed
   // primary is replaced (or reconnected to) on this request instead of failing.
   // ensureReady() also absorbs the extension's reconnect window, so a call that
-  // lands mid-reconnect waits instead of failing.
-  await broker.ensureReady?.();
+  // lands mid-reconnect waits instead of failing. Passing the signal keeps that
+  // wait interruptible, so Escape is not swallowed by the reconnect budget.
+  await broker.ensureReady?.({ signal });
+  if (signal?.aborted) throw coerceError(abortError(type, signal));
   ensureBridgeConnected(broker, type);
 
   let response: ResponseFrame;

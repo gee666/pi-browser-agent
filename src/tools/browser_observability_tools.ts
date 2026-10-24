@@ -5,9 +5,11 @@ import {
   coerceError,
   defaultTimeoutMs,
   formatJsonResult,
+  formatToolFailureText,
   requestBridge,
   textResult,
 } from './read_only/common.ts';
+import { isAbortError } from '../broker/abort.ts';
 import type { ToolResult } from './read_only/common.ts';
 
 function withDefaultActiveTabTarget(params: Record<string, unknown>) {
@@ -58,11 +60,16 @@ export function createBrowserGetConsoleLogsTool(broker: BrowserAgentBroker) {
       include_stack: Type.Optional(Type.Boolean()),
       timeout_ms: Type.Optional(Type.Number({ minimum: 1, maximum: 60_000 })),
     }),
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResult> {
+    async execute(
+      _toolCallId: string,
+      params: Record<string, unknown>,
+      signal?: AbortSignal,
+    ): Promise<ToolResult> {
       const requestParams = withDefaultActiveTabTarget(params);
       try {
         const { data } = await requestBridge<Record<string, unknown>>(broker, 'browser_get_console_logs', requestParams, {
           timeoutMs: Number(requestParams.timeout_ms || defaultTimeoutMs('browser_get_console_logs')),
+          signal,
         });
 
         const rendered = await formatJsonResult('Browser console logs', data, 'json');
@@ -80,8 +87,9 @@ export function createBrowserGetConsoleLogsTool(broker: BrowserAgentBroker) {
         return textResult(consoleLogText(details), details);
       } catch (error) {
         const info = coerceError(error);
-        return textResult(`browser_get_console_logs failed: ${info.message}`, {
+        return textResult(formatToolFailureText('browser_get_console_logs', info), {
           ok: false,
+          cancelled: isAbortError(error) || undefined,
           error: { code: info.code, message: info.message, details: info.details },
         });
       }
@@ -124,11 +132,16 @@ export function createBrowserGetNetworkTool(broker: BrowserAgentBroker) {
       include_timing: Type.Optional(Type.Boolean()),
       timeout_ms: Type.Optional(Type.Number({ minimum: 1, maximum: 60_000 })),
     }),
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResult> {
+    async execute(
+      _toolCallId: string,
+      params: Record<string, unknown>,
+      signal?: AbortSignal,
+    ): Promise<ToolResult> {
       const requestParams = withDefaultActiveTabTarget(params);
       try {
         const { data } = await requestBridge<Record<string, unknown>>(broker, 'browser_get_network', requestParams, {
           timeoutMs: Number(requestParams.timeout_ms || defaultTimeoutMs('browser_get_network')),
+          signal,
         });
 
         const rendered = await formatJsonResult('Browser network activity', data, 'json');
@@ -146,8 +159,9 @@ export function createBrowserGetNetworkTool(broker: BrowserAgentBroker) {
         return textResult(networkText(details), details);
       } catch (error) {
         const info = coerceError(error);
-        return textResult(`browser_get_network failed: ${info.message}`, {
+        return textResult(formatToolFailureText('browser_get_network', info), {
           ok: false,
+          cancelled: isAbortError(error) || undefined,
           error: { code: info.code, message: info.message, details: info.details },
         });
       }

@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { Type } from '@sinclair/typebox';
 
 import type { BrowserAgentBroker } from '../../broker/server.ts';
+import { isAbortError } from '../../broker/abort.ts';
 import {
   BrowserReadOnlyToolError,
   type ReadOnlyToolDefinition,
@@ -10,6 +11,7 @@ import {
   defaultTimeoutMs,
   formatJsonResult,
   formatTextResult,
+  formatToolFailureText,
   imageResult,
   inferFileExtensionFromMime,
   normalizeScreenshotPayload,
@@ -57,10 +59,11 @@ function createJsonReadOnlyTool<TParams>(
     description: config.description,
     promptSnippet: config.promptSnippet,
     parameters: config.parameters,
-    async execute(_toolCallId: string, params: TParams) {
+    async execute(_toolCallId: string, params: TParams, signal?: AbortSignal) {
       try {
         const { data, response } = await requestBridge<any>(broker, config.name, params, {
           timeoutMs: config.timeoutMs ? config.timeoutMs(params) : defaultTimeoutMs(config.name),
+          signal,
         });
         const normalized = config.normalizeData ? config.normalizeData(data) : data;
         const formatted = await formatJsonResult(config.title(normalized, params), normalized);
@@ -74,8 +77,9 @@ function createJsonReadOnlyTool<TParams>(
         });
       } catch (error) {
         const info = coerceError(error);
-        return textResult(`${config.label} failed: ${info.message}`, {
+        return textResult(formatToolFailureText(config.label, info), {
           ok: false,
+          cancelled: isAbortError(error) || undefined,
           requestType: config.name,
           error: { code: info.code, message: info.message, details: info.details },
         });
@@ -117,10 +121,11 @@ function createScreenshotTool(broker: BrowserAgentBroker): ReadOnlyToolDefinitio
       quality: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       max_width: Type.Optional(Type.Number({ minimum: 1 })),
     }),
-    async execute(_toolCallId: string, params: any) {
+    async execute(_toolCallId: string, params: any, signal?: AbortSignal) {
       try {
         const { data, response } = await requestBridge<any>(broker, 'browser_get_screenshot', params, {
           timeoutMs: defaultTimeoutMs('browser_get_screenshot'),
+          signal,
         });
         const normalized = normalizeScreenshotPayload(data);
         let path = normalized.path;
@@ -165,8 +170,9 @@ function createScreenshotTool(broker: BrowserAgentBroker): ReadOnlyToolDefinitio
         return textResult(text, details);
       } catch (error) {
         const info = coerceError(error);
-        return textResult(`browser_get_screenshot failed: ${info.message}`, {
+        return textResult(formatToolFailureText('browser_get_screenshot', info), {
           ok: false,
+          cancelled: isAbortError(error) || undefined,
           requestType: 'browser_get_screenshot',
           error: { code: info.code, message: info.message, details: info.details },
         });
@@ -193,10 +199,11 @@ function createHtmlTool(broker: BrowserAgentBroker): ReadOnlyToolDefinition<any>
       strip: Type.Optional(includeType(['script', 'style', 'comments'])),
       max_bytes: Type.Optional(Type.Number({ minimum: 1 })),
     }),
-    async execute(_toolCallId: string, params: any) {
+    async execute(_toolCallId: string, params: any, signal?: AbortSignal) {
       try {
         const { data, response } = await requestBridge<any>(broker, 'browser_get_html', params, {
           timeoutMs: defaultTimeoutMs('browser_get_html'),
+          signal,
         });
         if (typeof data?.html !== 'string' && typeof data?.content !== 'string') {
           throw new BrowserReadOnlyToolError(
@@ -217,8 +224,9 @@ function createHtmlTool(broker: BrowserAgentBroker): ReadOnlyToolDefinition<any>
         });
       } catch (error) {
         const info = coerceError(error);
-        return textResult(`browser_get_html failed: ${info.message}`, {
+        return textResult(formatToolFailureText('browser_get_html', info), {
           ok: false,
+          cancelled: isAbortError(error) || undefined,
           requestType: 'browser_get_html',
           error: { code: info.code, message: info.message, details: info.details },
         });
