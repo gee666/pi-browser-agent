@@ -485,8 +485,8 @@ export class RemoteBrowserAgentBroker {
         });
         resolve();
       });
-      socket.once('error', () => fail(new Error(`Port ${this.port} is busy, but it is not a pi-browser-agent broker`)));
-      socket.once('unexpected-response', () => fail(new Error(`Port ${this.port} is busy, but it is not a pi-browser-agent broker`)));
+      // A failed handshake can emit more errors while terminate() drains the transport.
+      socket.on('error', () => fail(new Error(`Port ${this.port} is busy, but it is not a pi-browser-agent broker`)));
     });
 
     // Belt and braces: never leave a rejected promise cached, whatever path the
