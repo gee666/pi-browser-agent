@@ -1,5 +1,7 @@
 # pi-browser-agent
 
+Tested against Pi 1.4.0
+
 `pi-browser-agent` is a pi extension that starts a local WebSocket broker and registers a browser-driving tool suite for `browser-agent-ext`.
 
 ## What it does
@@ -97,6 +99,14 @@ Example:
 ```bash
 PI_BA_HOST=0.0.0.0 pi
 ```
+
+## Development and release checks
+
+Run `npm test` to refresh the Pi coding-agent development dependency to npm's latest stable release, typecheck the project, and run the suite. Registry access is required; the update can change `package.json` and `package-lock.json`. Dependency lifecycle scripts are disabled during the update. Checks stop if the dependency update or typecheck fails.
+
+The tests include loading this extension through the installed Pi host, local broker lifecycle checks, and browser-tool protocol tests. They do not replace a live Chrome end-to-end check. `npm run typecheck` checks the currently installed dependencies without refreshing them.
+
+Before every release, update the tested-against line above to the actual Pi version that passed the checks, and keep the supported Pi peer range in `package.json` accurate. See `AGENTS.md` for the release and code quality rules.
 
 ## Notes
 
