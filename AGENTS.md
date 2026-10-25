@@ -1,31 +1,16 @@
-# Project instructions
+# Working preferences
 
-## Repository synchronization
-
-- Before starting any work, pull the latest changes from `origin` with `git pull --ff-only`. Preserve local edits; stop and resolve safely if the pull is blocked.
-- After each completed, validated piece of work, commit your changes and push to `origin` immediately. Work happens on multiple machines; do not leave finished work unsynchronized.
-
-## Pi compatibility and releases
-
-- Test only against the latest stable Pi release from npm. Do not add a minimum-version test matrix or rely on stale installed dependencies.
-- Run `npm test` before every release. Its `pretest` refreshes `@earendil-works/pi-coding-agent` from npm `latest` and runs strict TypeScript checks. The suite includes loading this extension through the installed Pi host, broker tests, and tool tests.
-- After successful checks, add or update the standalone README line `Tested against Pi <version>` using the actual installed coding-agent version. Update this line on every release and commit it with the release. Never claim a version that was not tested.
-- Declare host-provided Pi libraries in `peerDependencies`, not `dependencies`. Keep supported Pi version ranges in `package.json` accurate and development dependencies and the lockfile aligned with the tested version.
-- Keep this root `AGENTS.md` tracked and committed. Do not bump versions or publish packages unless requested.
-
-## Browser input boundary
-
-- Follow the parent project's native-input policy. All actual browser input must go through `python-input-control`. This Pi extension forwards requests to the Chrome extension; it must not bypass that executor with synthetic DOM events or direct DOM mutations.
-- Surface executor errors. Do not fall back to `element.click()`, `dispatchEvent()`, assignment to input values, or JavaScript scrolling.
+- Treat models as senior architects. Keep prompts task-specific, with my explicit preferences rather than generic advice or repeated global instructions.
+- Pull the latest changes from `origin` before starting work. Commit and push each finished piece as soon as it is ready; I work across multiple machines.
+- Test only against the latest Pi release. On every release, update the README line `Tested against Pi <version>` to the version actually tested and keep any supported-Pi metadata in `package.json` current.
 
 ## Code quality bar
 
-- Remove dead code, unused imports, and unused dependencies. Wire intended functionality into the extension instead of leaving disconnected code.
-- Keep Pi registration, WebSocket transport, broker lifecycle, protocol validation, task storage, and tool implementations separate. Follow existing Node.js, strict TypeScript, `ws`, and Pi API conventions.
+- Remove dead code, unused imports, and unused dependencies. Wire intended functionality into the application instead of leaving disconnected code.
+- Keep module responsibilities and dependency boundaries clear. Follow existing project conventions and use TypeScript libraries and frameworks as intended.
 - Avoid duplicated logic and unnecessary abstractions. Prefer simple, consistent solutions over one-off patterns.
-- Fix root causes, not symptoms. Avoid brittle workarounds. Make deployment-specific ports, paths, timeouts, and operational settings configurable. Never hardcode secrets or leak sensitive browser data in logs. Keep loopback binding as the default.
-- Use strict TypeScript and types that model valid application states. Validate bridge messages, tool arguments, and other external data at runtime. Do not introduce `any`, unsafe assertions, or suppressed type errors to bypass type safety.
-- Keep functions and classes focused. Split files by responsibility before they exceed 350 lines. Exceed this limit only when splitting would clearly hurt readability or cohesion, and explain why. Avoid unrelated restructuring during maintenance changes.
+- Fix root causes, not symptoms. Avoid brittle workarounds. Make deployment-specific values and operational settings configurable, and never hardcode secrets.
+- Use strict TypeScript and types that model valid application states. Validate external data at runtime. Do not bypass type safety with `any`, unsafe assertions, or suppressed type errors.
+- Keep functions and classes focused. Split files by responsibility before they exceed 350 lines. Exceed this limit only when splitting would clearly hurt readability or cohesion, and explain why.
 - Remove stale or irrelevant comments and docs. Keep useful ones accurate, short, clear, and human-friendly. Explain non-obvious decisions rather than restating code. Apply the unslop and write-prompts skills when available.
-- Add or update tests for changed behavior. Cover cancellation, broker acquisition, reconnection, shutdown, protocol errors, and input-executor boundaries when affected. Run the available type checks, lint checks, and relevant tests before considering work complete. This project currently has no lint script; do not claim a lint check was run.
-- Give every shell command a timeout. Keep temporary files and logs in the project's `tmp/` directory, and do not modify unrelated repositories or user changes.
+- Add or update tests for changed behavior. Run the project's available type checks, lint checks, and relevant tests before considering work complete.
