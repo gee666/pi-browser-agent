@@ -4,7 +4,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { TSchema } from '@sinclair/typebox';
+import type { TSchema } from 'typebox';
 
 import type { BrowserAgentBroker } from '../../broker/server.ts';
 import type { ResponseFrame } from '../../broker/protocol.ts';

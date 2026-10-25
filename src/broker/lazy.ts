@@ -14,12 +14,9 @@ export interface BrokerLike {
 /**
  * A broker handle that resolves its real backing broker lazily, on every call.
  *
- * Why this exists: pi reads the tool registry once at session_start, and any
- * registerTool() after that is dropped. Previously the browser_* suite was only
- * registered when the broker happened to be listening at session_start, so a pi
- * instance started while the browser stack was down had NO browser tools for its
- * entire lifetime — unrecoverable without restarting pi. And a session whose
- * broker later died held a dead object forever.
+ * Registering tools independently of broker availability keeps them visible
+ * while Chrome is offline. Resolving at call time also avoids holding a dead
+ * broker after a disconnect or primary-process failover.
  *
  * With this handle the tools are always registered and always re-resolve the
  * broker at call time, so the integration heals itself whenever the browser

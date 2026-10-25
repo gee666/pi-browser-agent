@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { Socket } from 'node:net';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 
 interface BridgeSocket extends WebSocket {
@@ -102,6 +104,7 @@ export class BrowserAgentBroker {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private sockets = new Set<BridgeSocket>();
+  private transports = new Set<Socket>();
   private listeningSince: number | null = null;
   private bridgeEverConnected = false;
   private lastBridgeConnectedAt: number | null = null;
@@ -419,7 +422,16 @@ export class BrowserAgentBroker {
 
   private async tryBind(candidate: number): Promise<void> {
     await new Promise<void>((resolve, reject) => {
-      const server = new WebSocketServer({ host: this.host, port: candidate });
+      const httpServer = createServer((_request, response) => {
+        response.writeHead(426, { 'Content-Type': 'text/plain' });
+        response.end('Upgrade Required');
+      });
+      httpServer.on('connection', (socket) => {
+        this.transports.add(socket);
+        socket.once('close', () => this.transports.delete(socket));
+      });
+      const server = new WebSocketServer({ server: httpServer });
+      server.once('close', () => httpServer.close());
 
       const onError = (error: Error) => {
         server.off('listening', onListening);
@@ -454,6 +466,7 @@ export class BrowserAgentBroker {
       server.on('connection', (socket: WebSocket) => {
         void this.handleConnection(socket);
       });
+      httpServer.listen(candidate, this.host);
     });
   }
 
@@ -473,6 +486,13 @@ export class BrowserAgentBroker {
     this.notifyBridgeWaiters(false);
     this.bridgeStateListeners.clear();
 
+    // Finish upgraded connections before closing the listener. The packaged
+    // Pi runtime can otherwise leave ws's HTTP close callback pending forever,
+    // even after all clients have completed their closing handshakes.
+    const closingSockets = [...this.sockets].map((socket) => new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => socket.terminate(), 250);
+      socket.once('close', () => { clearTimeout(timeout); resolve(); });
+    }));
     for (const socket of this.sockets) {
       try {
         socket.close();
@@ -492,6 +512,11 @@ export class BrowserAgentBroker {
       }
     }
 
+    await Promise.all(closingSockets);
+    // Explicitly retire upgraded TCP transports too; a completed WebSocket
+    // handshake need not mean the host HTTP server has released its connection.
+    for (const socket of this.transports) socket.destroy();
+    this.transports.clear();
     this.listeningSince = null;
 
     if (this.server) {

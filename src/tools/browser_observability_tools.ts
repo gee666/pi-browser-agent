@@ -1,4 +1,4 @@
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import {

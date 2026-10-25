@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import type { ResponseFrame } from '../broker/protocol.ts';

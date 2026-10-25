@@ -1,9 +1,10 @@
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import { formatBridgeFailure } from '../broker/diagnostics.ts';
 import { ABORT_ERROR_CODE } from '../broker/abort.ts';
 import { getPlaceholderBrowserToolSpecs } from './_register.ts';
+import type { ToolResult } from './read_only/common.ts';
 
 export function resetBrowserAgentToolState(): void {
   // No-op retained for API compatibility. Browser tool registration is now
@@ -46,7 +47,7 @@ export function createBrowserAgentToolsTool(
       'Diagnose and repair the browser integration. Forces a lazy re-acquire of the broker port (promoting this pi process to primary if the previous owner died) and waits for the Chrome extension bridge to reconnect. Call this whenever a browser_* tool reports E_BRIDGE_DISCONNECTED; it returns the full connectivity state plus recovery steps.',
     promptSnippet: 'Diagnose and repair the browser integration for this session.',
     parameters: Type.Object({}),
-    async execute(_toolCallId: string, _params: Record<string, unknown>, signal?: AbortSignal) {
+    async execute(_toolCallId: string, _params: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
       // Lazily (re)acquire the broker so a killed primary is replaced on demand
       // when someone actually asks for the browser tools. Only do this for the
       // lifecycle-managed singleton — never for the throwaway fallback broker,

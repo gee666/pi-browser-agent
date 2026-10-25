@@ -1,4 +1,6 @@
 import { join } from 'node:path';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { withNativeResult } from './tools/native-result.ts';
 
 import { BrowserAgentBroker, type BrokerLogger } from './broker/server.ts';
 import { RemoteBrowserAgentBroker } from './broker/remote.ts';
@@ -41,6 +43,7 @@ export function getStartupMessage(): string | null {
 }
 
 export async function resetForTests(): Promise<void> {
+  removeSignalHandlers?.();
   brokerShuttingDown = true;
   brokerLifecycleGeneration += 1;
   sessionLifecycleGeneration += 1;
@@ -137,7 +140,7 @@ async function createAndStartBroker(logger: BrokerLogger): Promise<BrowserAgentB
   }
 }
 
-let signalHandlersInstalled = false;
+let removeSignalHandlers: (() => void) | null = null;
 let suspending = false;
 let resumeGeneration = 0;
 
@@ -154,12 +157,10 @@ let resumeGeneration = 0;
  * process like the default Ctrl+Z). On SIGCONT we re-acquire the broker.
  */
 function installSuspendResumeHandlers(): void {
-  if (signalHandlersInstalled) return;
+  if (removeSignalHandlers) return;
   // SIGTSTP/SIGCONT are POSIX-only; nothing to do on Windows.
   if (process.platform === 'win32') return;
-  signalHandlersInstalled = true;
-
-  process.on('SIGTSTP', () => {
+  const onSuspend = () => {
     if (suspending) return;
     suspending = true;
     brokerShuttingDown = true;
@@ -184,9 +185,9 @@ function installSuspendResumeHandlers(): void {
         try { process.kill(process.pid, 'SIGSTOP'); } catch { /* ignore */ }
       }
     })();
-  });
+  };
 
-  process.on('SIGCONT', () => {
+  const onResume = () => {
     if (!suspending) return;
     suspending = false;
     resumeGeneration += 1;
@@ -216,7 +217,15 @@ function installSuspendResumeHandlers(): void {
         // re-resolves the lazy handle; the health reporter owns any warning.
       }
     })();
-  });
+  };
+  process.on('SIGTSTP', onSuspend);
+  process.on('SIGCONT', onResume);
+  removeSignalHandlers = () => {
+    process.off('SIGTSTP', onSuspend);
+    process.off('SIGCONT', onResume);
+    removeSignalHandlers = null;
+    suspending = false;
+  };
 }
 
 /** Republish instance discovery when a secondary wins the bind race. Without
@@ -300,10 +309,7 @@ async function getOrCreateBroker(logger: BrokerLogger): Promise<BrowserAgentBrok
   return await startup;
 }
 
-export default async function piBrowserAgentExtension(pi: {
-  on: (event: string, handler: (_event: unknown, ctx?: ExtensionContextLike) => Promise<void> | void) => void;
-  registerTool: (tool: any) => void;
-}) {
+export default async function piBrowserAgentExtension(pi: ExtensionAPI) {
   const registerSessionTool = async (ctx?: ExtensionContextLike) => {
     const sessionGeneration = ++sessionLifecycleGeneration;
     for (const cleanup of [...sessionCleanups]) cleanup();
@@ -326,9 +332,8 @@ export default async function piBrowserAgentExtension(pi: {
       attachedBroker = broker;
     };
 
-    // pi reads the tool registry once at session_start; any later
-    // registerTool() call is dropped. So we ALWAYS register the full browser_*
-    // suite, backed by a lazy handle that re-acquires the broker on every tool
+    // Register the full browser_* suite independently of bridge availability,
+    // backed by a lazy handle that re-acquires the broker on every tool
     // call. That way a session started while Chrome/the broker was down still
     // gets working tools the moment the browser comes back, with no restart.
     // The handle's task store is used directly by the task tools, so it must be
@@ -386,7 +391,7 @@ export default async function piBrowserAgentExtension(pi: {
       attachedBroker = null;
     });
 
-    pi.registerTool(createBrowserAgentToolsTool(pi, handle as any));
+    pi.registerTool(withNativeResult(createBrowserAgentToolsTool(pi, handle as any)));
     registerAllTools(pi, { broker: handle as any });
 
     // Best-effort eager acquisition so the session starts out connected and the
@@ -403,15 +408,13 @@ export default async function piBrowserAgentExtension(pi: {
     observeHealth();
   };
 
-  // Install once per process so Ctrl+Z releases the broker port instead of
-  // freezing it while still bound.
-  installSuspendResumeHandlers();
-
   pi.on('session_start', async (_event, ctx) => {
+    installSuspendResumeHandlers();
     await registerSessionTool(ctx);
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
+    removeSignalHandlers?.();
     brokerShuttingDown = true;
     brokerLifecycleGeneration += 1;
     sessionLifecycleGeneration += 1;

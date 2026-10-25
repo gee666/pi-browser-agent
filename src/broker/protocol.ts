@@ -1,6 +1,5 @@
-import { Type } from '@sinclair/typebox';
-import type { Static } from '@sinclair/typebox';
-import { Value } from '@sinclair/typebox/value';
+import { Type, type Static } from 'typebox';
+import { Value } from 'typebox/value';
 
 export const PROTOCOL_VERSION = 1;
 

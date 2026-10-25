@@ -1,4 +1,6 @@
-import { Type } from '@sinclair/typebox';
+import type { ExtensionAPI, ToolDefinition } from '@earendil-works/pi-coding-agent';
+import type { TSchema } from 'typebox';
+import { withNativeResult } from './native-result.ts';
 
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import {
@@ -49,9 +51,9 @@ export function getPlaceholderBrowserToolSpecs(): Array<{ name: string; descript
   return PLACEHOLDER_TOOL_SPECS.map(([name, description]) => ({ name, description }));
 }
 
-export function registerAllTools(pi: { registerTool: (tool: any) => void }, { broker }: { broker: BrowserAgentBroker }) {
+export function registerAllTools(pi: Pick<ExtensionAPI, 'registerTool'>, { broker }: { broker: BrowserAgentBroker }) {
   const newlyRegistered: string[] = [];
-  const realTools = new Map<string, any>([
+  const realTools = new Map<string, ToolDefinition<TSchema, Record<string, unknown>>>([
     ['browser_run_task', createBrowserRunTaskTool(broker)],
     ['browser_get_task_history', createBrowserGetTaskHistoryTool(broker)],
     ['browser_list_tasks', createBrowserListTasksTool(broker)],
@@ -60,27 +62,14 @@ export function registerAllTools(pi: { registerTool: (tool: any) => void }, { br
     ...createBrowserJsNavigationToolFamily(broker).map((tool) => [tool.name, tool] as const),
   ]);
 
-  for (const [name, description] of PLACEHOLDER_TOOL_SPECS) {
+  for (const [name] of PLACEHOLDER_TOOL_SPECS) {
     if (registeredToolNames.has(name)) {
       continue;
     }
 
-    pi.registerTool(
-      realTools.get(name) ?? {
-        name,
-        label: name,
-        description: `${description} This tool was expected to be registered but no implementation was found.`,
-        promptSnippet: description,
-        parameters: Type.Object({}, { additionalProperties: true }),
-        async execute() {
-          const probe = broker.probeConnectivity();
-          return {
-            content: [{ type: 'text', text: `${name} is unavailable because its implementation was not registered.` }],
-            details: { probe, ok: false, error: { code: 'E_INTERNAL', message: `${name} implementation missing` } },
-          };
-        },
-      },
-    );
+    const tool = realTools.get(name);
+    if (!tool) throw new Error(`${name} implementation missing`);
+    pi.registerTool(withNativeResult(tool));
 
     registeredToolNames.add(name);
     newlyRegistered.push(name);

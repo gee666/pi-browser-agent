@@ -7,7 +7,7 @@ Tested against Pi 1.4.0
 ## What it does
 
 - starts a loopback-only broker on `ws://127.0.0.1:7878` by default
-- registers the full `browser_*` tool suite at session start when the broker starts listening
+- registers the full `browser_*` tool suite at session start, even while the broker or bridge is unavailable
 - exposes `activate_browser_agent_tools` as a self-check / status tool
 - forwards tool calls to `browser-agent-ext`
 - keeps browser-task history on disk for local inspection
@@ -43,7 +43,7 @@ For the current in-repo state, use the local-checkout form above.
 
 ## First use in a pi session
 
-All `browser_*` tools are registered at session start when the broker starts listening. `activate_browser_agent_tools` remains available as a self-check / status tool:
+All `browser_*` tools are registered at session start independently of broker availability. `activate_browser_agent_tools` remains available as a self-check / status tool:
 
 ```text
 activate_browser_agent_tools
@@ -64,11 +64,13 @@ The full toolkit registered for the session is:
 - `browser_get_performance_metrics`
 - `browser_evaluate_js`
 - `browser_run_js`
+- `browser_create_tab`
 - `browser_list_tabs`
 - `browser_switch_tab`
 - `browser_close_tab`
 - `browser_navigate`
 - `browser_reload`
+- `browser_reload_extension`
 - `browser_wait_for`
 - `browser_clear_site_data`
 
@@ -102,9 +104,11 @@ PI_BA_HOST=0.0.0.0 pi
 
 ## Development and release checks
 
-Run `npm test` to refresh the Pi coding-agent development dependency to npm's latest stable release, typecheck the project, and run the suite. Registry access is required; the update can change `package.json` and `package-lock.json`. Dependency lifecycle scripts are disabled during the update. Checks stop if the dependency update or typecheck fails.
+Run `npm ci --ignore-scripts` to install the locked development dependencies, then `npm test` to typecheck and run the suite. The Pi SDK development dependency is pinned to the tested release; tests do not update the manifest or lockfile.
 
-The tests include loading this extension through the installed Pi host, local broker lifecycle checks, and browser-tool protocol tests. They do not replace a live Chrome end-to-end check. `npm run typecheck` checks the currently installed dependencies without refreshing them.
+The tests include SDK extension loading, local broker lifecycle checks, and browser-tool protocol tests. `npm run typecheck` checks the currently installed dependencies. Registered tools retain their text/image output and persisted details, and additionally expose JSON-normalized details through Pi's `outputSchema`/`structuredContent` APIs. Failed browser operations set `isError: true` so Pi and programmatic callers can distinguish failures without parsing text.
+
+Also run `PI_EVERGREEN_PI_BIN=/absolute/path/to/global/pi npm run test:e2e`. This explicitly loads the local extension into that real Pi CLI, using an isolated agent directory, a deterministic local OpenAI-compatible SSE endpoint and a WebSocket bridge fixture (no credentials or model charges). It checks actual outbound requests, tool execution, retry/abort recovery, compaction, reload with a connected bridge, persistent task history, session replacement and cleanup. Linux also exercises real suspend/resume. `PI_EVERGREEN_E2E_PROVIDER`, `PI_EVERGREEN_E2E_MODEL` and `PI_EVERGREEN_E2E_REASONING` select the test model identity (defaults: `openai`, `gpt-6-luna`, `medium`). These tests do not replace a live Chrome end-to-end check.
 
 Before every release, update the tested-against line above to the actual Pi version that passed the checks, and keep the supported Pi peer range in `package.json` accurate. See `AGENTS.md` for the release and code quality rules.
 

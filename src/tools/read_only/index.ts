@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 
 import type { BrowserAgentBroker } from '../../broker/server.ts';
 import { isAbortError } from '../../broker/abort.ts';
