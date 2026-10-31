@@ -225,7 +225,7 @@ function createRequestTool(options: {
     parameters: options.parameters,
     // `signal` is pi's cancellation handle (Escape). Accepting it here is what
     // lets an aborted call return at once instead of blocking until the
-    // per-tool timeout (15s eval / 30s run_js / navigation budgets) expires.
+    // per-tool timeout, including AI script translation, expires.
     async execute(
       _toolCallId: string,
       params: Record<string, unknown>,
@@ -291,7 +291,7 @@ export const browserEvaluateJsDefinition = {
     await_promise: Type.Optional(Type.Boolean({ default: true })),
     return_by_value: Type.Optional(Type.Boolean({ default: true })),
     world: Type.Optional(Type.Literal('main', { default: 'main' })),
-    timeout_ms: Type.Optional(Type.Number({ minimum: 1, default: 15_000 })),
+    timeout_ms: Type.Optional(Type.Number({ minimum: 1, default: 120_000 })),
   }),
 } as const;
 
@@ -306,7 +306,7 @@ export const browserRunJsDefinition = {
     args: Type.Optional(Type.Array(Type.Unknown())),
     return_by_value: Type.Optional(Type.Boolean({ default: true })),
     world: Type.Optional(Type.Literal('main', { default: 'main' })),
-    timeout_ms: Type.Optional(Type.Number({ minimum: 1, default: 30_000 })),
+    timeout_ms: Type.Optional(Type.Number({ minimum: 1, default: 120_000 })),
     capture_console: Type.Optional(Type.Boolean({ default: true })),
   }),
 } as const;
@@ -421,12 +421,12 @@ export const browserClearSiteDataDefinition = {
 
 export const createBrowserEvaluateJsTool = createRequestTool({
   ...browserEvaluateJsDefinition,
-  timeoutFromParams: (params) => Number(params.timeout_ms ?? 15_000) + 1_000,
+  timeoutFromParams: (params) => Number(params.timeout_ms ?? 120_000) + 1_000,
 });
 
 export const createBrowserRunJsTool = createRequestTool({
   ...browserRunJsDefinition,
-  timeoutFromParams: (params) => Number(params.timeout_ms ?? 30_000) + 1_000,
+  timeoutFromParams: (params) => Number(params.timeout_ms ?? 120_000) + 1_000,
 });
 
 export const createBrowserCreateTabTool = createRequestTool({

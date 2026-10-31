@@ -13,7 +13,7 @@ interface ToolResult {
   details: Record<string, unknown>;
 }
 
-const TERMINAL_TASK_STATUSES = new Set(['done', 'error', 'stopped', 'rejected']);
+const TERMINAL_TASK_STATUSES = new Set(['done', 'error', 'stopped', 'rejected', 'paused']);
 
 function terminalStatusOf(data: any): string | null {
   if (typeof data?.status === 'string' && TERMINAL_TASK_STATUSES.has(data.status)) {
@@ -67,6 +67,8 @@ function statusText(status: string): string {
   switch (status) {
     case 'done':
       return 'completed';
+    case 'paused':
+      return 'paused for manual input';
     case 'stopped':
       return 'stopped';
     case 'error':

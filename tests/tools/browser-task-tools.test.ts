@@ -84,6 +84,32 @@ function textOf(result: any): string {
   return result.content[0]?.text || '';
 }
 
+test('browser_run_task preserves a manual CAPTCHA pause without claiming completion', async () => {
+  const { broker } = await createBroker();
+  const socket = await connectBridge(broker, async (frame, ws) => {
+    if (frame.type !== 'browser_run_task') return;
+    ws.send(JSON.stringify({ v: 1, kind: 'response', id: frame.id, ok: true, data: {
+      status: 'paused', reason: 'manual_captcha', manualRequired: true, success: false,
+      message: 'Complete the CAPTCHA manually, then start a new task.',
+      handoff: { type: 'manual_captcha', screenshotCaptured: false },
+    } }));
+  });
+  try {
+    const tools = createToolHarness(broker);
+    const result = await tools.get('browser_run_task').execute('manual-captcha', { task: 'Open the form' });
+    assert.equal(result.details.ok, true);
+    assert.equal(result.details.success, false);
+    assert.equal(result.details.status, 'paused');
+    assert.equal(result.details.result.manualRequired, true);
+    assert.match(textOf(result), /paused for manual input/);
+    const history = await broker.taskStore.read(String(result.details.taskId));
+    assert.equal(history.at(-1)?.status, 'paused');
+  } finally {
+    socket.close();
+    await broker.stop();
+  }
+});
+
 test('browser_run_task happy path targets the active tab and records useful history', async () => {
   const { broker } = await createBroker();
   let receivedRequest: any;

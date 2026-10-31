@@ -80,6 +80,10 @@ The full toolkit registered for the session is:
 
 This is a bounded JavaScript translation interface, not an arbitrary JavaScript runtime. Supported actions and fixed DOM reads preserve the plan's result. Unsupported code, invalid model responses, missing provider configuration, cancellation and native-input failures return errors. They never fall back to `element.click()`, synthetic events or direct DOM input. Requesting remote object handles or disabling promise awaiting is unsupported. Console capture is limited to entries represented by the translated plan.
 
+The default script timeout is 120 seconds to include model translation and native input. In Jev mode, translation uses the configured helper LLM, not the Jev choice endpoint. In normal mode it uses the configured browser LLM.
+
+Both decision modes can report a CAPTCHA through the manual-handoff choice. The task ends with `status: "paused"`, `manualRequired: true` and a screenshot handoff when capture succeeds. No solver model or native input runs after that choice. Complete the challenge yourself, then start a new task. This is not automatic CAPTCHA solving.
+
 Use the dedicated inspection tools for HTML, styles, accessibility and other general page inspection. Their trusted internal inspection functions do not go through AI translation. The `world` option does not enable direct page-code execution.
 
 ## Configuration
