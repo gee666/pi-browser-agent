@@ -282,7 +282,7 @@ function createRequestTool(options: {
 
 export const browserEvaluateJsDefinition = {
   name: 'browser_evaluate_js',
-  description: 'Translate a JavaScript expression with the configured browser AI model, then execute its validated native-input/read plan. Clicks, typing, keys and scrolling use python-input-control, with off-screen targets scrolled into view first. Unsupported JavaScript is rejected, never executed directly. Requires a configured browser AI provider.',
+  description: 'Translate a JavaScript expression with the configured browser AI model, then execute its validated native-input/read plan. Clicks, typing, keys and scrolling use the input backend selected in extension settings, either CDP or Python, with off-screen targets scrolled into view first. Unsupported JavaScript is rejected, never executed directly. Requires a configured browser AI provider.',
   promptSnippet: 'Translate a JavaScript expression into validated native input and page reads.',
   parameters: Type.Object({
     tab_id: Type.Optional(Type.Number()),
@@ -297,7 +297,7 @@ export const browserEvaluateJsDefinition = {
 
 export const browserRunJsDefinition = {
   name: 'browser_run_js',
-  description: 'Translate a JavaScript program with the configured browser AI model, then execute its validated native-input/read plan. All input uses python-input-control; off-screen targets are scrolled into view first. Supports a bounded set of actions and reads, not arbitrary page JavaScript. Unsupported code fails without direct JavaScript execution.',
+  description: 'Translate a JavaScript program with the configured browser AI model, then execute its validated native-input/read plan. All input uses the backend selected in extension settings, either CDP or Python; off-screen targets are scrolled into view first. Supports a bounded set of actions and reads, not arbitrary page JavaScript. Unsupported code fails without direct JavaScript execution.',
   promptSnippet: 'Translate JavaScript into validated native input and page reads.',
   parameters: Type.Object({
     tab_id: Type.Optional(Type.Number()),
