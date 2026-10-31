@@ -101,6 +101,17 @@ test('browser_evaluate_js forwards timeout-aware requests, defaults to the activ
   assert.match(textOf(result), /Full output:/);
 });
 
+test('script transport defaults allow 120 seconds for AI translation plus bridge overhead', async () => {
+  const budgets: number[] = [];
+  const broker = createBrokerStub(async (_type, _params, options) => {
+    budgets.push(options.timeoutMs ?? 0);
+    return { v: 1, kind: 'response', id: 'script-budget', ok: true, data: { tabId: 7, value: 1 } };
+  });
+  await createBrowserEvaluateJsTool(broker).execute('evaluate-budget', { expression: '1' });
+  await createBrowserRunJsTool(broker).execute('program-budget', { code: 'return 1;' });
+  assert.deepEqual(budgets, [121_000, 121_000]);
+});
+
 test('browser_run_js returns structured bridge failures instead of throwing', async () => {
   const broker = createBrokerStub(async () => ({
     v: 1,
