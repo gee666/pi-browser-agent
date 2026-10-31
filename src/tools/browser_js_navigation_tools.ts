@@ -282,8 +282,8 @@ function createRequestTool(options: {
 
 export const browserEvaluateJsDefinition = {
   name: 'browser_evaluate_js',
-  description: 'Evaluate a JavaScript expression in the page and return the value.',
-  promptSnippet: 'Evaluate JavaScript in the current browser page.',
+  description: 'Translate a JavaScript expression with the configured browser AI model, then execute its validated native-input/read plan. Clicks, typing, keys and scrolling use python-input-control, with off-screen targets scrolled into view first. Unsupported JavaScript is rejected, never executed directly. Requires a configured browser AI provider.',
+  promptSnippet: 'Translate a JavaScript expression into validated native input and page reads.',
   parameters: Type.Object({
     tab_id: Type.Optional(Type.Number()),
     use_active_tab: Type.Optional(Type.Boolean()),
@@ -297,8 +297,8 @@ export const browserEvaluateJsDefinition = {
 
 export const browserRunJsDefinition = {
   name: 'browser_run_js',
-  description: 'Run a longer JavaScript program in the page context and optionally capture console output.',
-  promptSnippet: 'Run longer JavaScript in the browser page.',
+  description: 'Translate a JavaScript program with the configured browser AI model, then execute its validated native-input/read plan. All input uses python-input-control; off-screen targets are scrolled into view first. Supports a bounded set of actions and reads, not arbitrary page JavaScript. Unsupported code fails without direct JavaScript execution.',
+  promptSnippet: 'Translate JavaScript into validated native input and page reads.',
   parameters: Type.Object({
     tab_id: Type.Optional(Type.Number()),
     use_active_tab: Type.Optional(Type.Boolean()),

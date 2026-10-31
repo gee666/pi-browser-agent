@@ -19,6 +19,15 @@ import {
   createBrowserSwitchTabTool,
 } from '../../src/tools/browser_js_navigation_tools.ts';
 
+test('JavaScript tools disclose AI translation and native-only input instead of arbitrary page execution', () => {
+  for (const definition of [browserEvaluateJsDefinition, browserRunJsDefinition]) {
+    assert.match(definition.description, /configured browser AI model/);
+    assert.match(definition.description, /python-input-control/);
+    assert.match(definition.description, /Unsupported/);
+    assert.match(definition.description, /off-screen/);
+  }
+});
+
 function textOf(result: any): string {
   return result.content[0]?.text || '';
 }
