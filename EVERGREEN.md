@@ -22,7 +22,9 @@ public `ExtensionAPI` and `ToolDefinition` types from the package root.
 `pi.registerTool` uses TypeBox parameters, execute's AbortSignal, text/image
 content, persisted details, outputSchema, structuredContent and isError.
 `ctx.ui.setStatus` and `notify` report connectivity with delayed outage warnings.
-The host TypeBox peer dependency must remain compatible with Pi's validator.
+Tool parameters use JSON Schema-compatible TypeBox constructs; Pi 1.5.0 validates
+and coerces arguments with `@earendil-works/pi-schema`, not TypeBox validation.
+Runtime schema imports already use `typebox`, not the legacy pi-ai re-exports.
 ## Internal Pi APIs
 None in runtime code: no deep imports, private fields or undocumented Pi hooks.
 The compatibility test uses the exported `discoverAndLoadExtensions` loader.
@@ -51,10 +53,10 @@ bridge task execution, result/error persistence, cross-process history and clean
 A live EVERGREEN_E2E_MODEL call must discover and execute browser_list_tasks even
 without Chrome. Settings/state are isolated; provider credentials are reused.
 These tests protect available tools, working forwarding and durable inspection,
-not merely individual helper outputs. Tested against latest Pi 1.4.0.
+not merely individual helper outputs. Tested against latest Pi 1.5.0.
 
 ## Relevant changelog topics
 Watch extension lifecycle/reload, tool registration and execution signatures,
-AbortSignal propagation, TypeBox validation, text/image result formats,
+AbortSignal propagation, JSON Schema validation/coercion, text/image result formats,
 outputSchema/structuredContent/isError, session serialization, UI status APIs,
 CLI JSON events, provider transport and SDK extension loading.

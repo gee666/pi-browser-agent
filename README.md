@@ -1,6 +1,6 @@
 # pi-browser-agent
 
-Tested against Pi 1.4.0
+Tested against Pi 1.5.0
 
 `pi-browser-agent` is a pi extension that starts a local WebSocket broker and registers a browser-driving tool suite for `browser-agent-ext`.
 
