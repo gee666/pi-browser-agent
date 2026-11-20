@@ -15,7 +15,6 @@ const TAB_TARGETED_TOOLS = new Set([
   'browser_get_network',
   'browser_get_accessibility_tree',
   'browser_get_performance_metrics',
-  'browser_evaluate_js',
   'browser_run_js',
   'browser_navigate',
   'browser_switch_tab',

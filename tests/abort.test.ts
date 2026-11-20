@@ -10,7 +10,7 @@ import WebSocket from 'ws';
 import { BrowserAgentBroker } from '../src/broker/server.ts';
 import { TaskStore } from '../src/broker/task-store.ts';
 import { ABORT_ERROR_CODE, isAbortError, sleepUnlessAborted } from '../src/broker/abort.ts';
-import { createBrowserEvaluateJsTool } from '../src/tools/browser_js_navigation_tools.ts';
+import { createBrowserRunJsTool } from '../src/tools/browser_js_navigation_tools.ts';
 import { createReadOnlyBrowserTools } from '../src/tools/read_only/index.ts';
 import type { ResponseFrame } from '../src/broker/protocol.ts';
 
@@ -19,7 +19,7 @@ import type { ResponseFrame } from '../src/broker/protocol.ts';
  *
  * Before this, every browser_* tool ignored the AbortSignal pi passes as the
  * third argument of execute(), so pressing Escape left the call pending until
- * its own timeout (15s for browser_evaluate_js, 30s for browser_run_js, 5min
+ * its own timeout (120s for browser_run_js, 5min
  * for browser_run_task). Each test below asserts we now settle promptly and
  * report the cancellation as such instead of as a browser failure.
  */
@@ -50,7 +50,7 @@ async function connectSilentBridge(port: number): Promise<WebSocket> {
       kind: 'hello',
       extensionId: 'ext-abort-test',
       version: '0.1.0',
-      capabilities: ['browser_evaluate_js', 'browser_get_html'],
+      capabilities: ['browser_run_js', 'browser_get_html'],
     })));
     socket.once('message', () => resolve(socket));
   });
@@ -83,7 +83,7 @@ test('broker.request rejects immediately when the caller aborts mid-flight', asy
     const startedAt = Date.now();
     // A 30s timeout stands in for browser_run_js: without abort support the
     // promise below could only settle after those 30 seconds.
-    const pending = broker.request('browser_evaluate_js', { expression: 'while(true){}' }, {
+    const pending = broker.request('browser_run_js', { tab_id: 7, code: 'return document.title;' }, {
       timeoutMs: 30_000,
       signal: controller.signal,
     });
@@ -115,7 +115,7 @@ test('broker.request refuses to send a request that is already cancelled', async
     controller.abort();
 
     const error = await broker
-      .request('browser_evaluate_js', { expression: '1' }, { signal: controller.signal })
+      .request('browser_run_js', { tab_id: 7, code: 'return 1;' }, { signal: controller.signal })
       .then(() => null, (reason) => reason);
 
     assert.ok(error);
@@ -150,7 +150,7 @@ test('waitForBridge stops waiting when the tool call is cancelled', async () => 
   }
 });
 
-test('browser_evaluate_js reports cancellation instead of a browser failure', async () => {
+test('browser_run_js reports cancellation instead of a browser failure', async () => {
   let capturedSignal: AbortSignal | undefined;
   const broker = {
     async ensureReady(options: { signal?: AbortSignal } = {}) {
@@ -168,7 +168,7 @@ test('browser_evaluate_js reports cancellation instead of a browser failure', as
     async request(_type: string, _params: unknown, options: { signal?: AbortSignal } = {}): Promise<ResponseFrame> {
       return await new Promise((_resolve, reject) => {
         options.signal?.addEventListener('abort', () => {
-          const error: any = new Error('browser_evaluate_js was cancelled');
+          const error: any = new Error('browser_run_js was cancelled');
           error.code = ABORT_ERROR_CODE;
           reject(error);
         });
@@ -176,9 +176,9 @@ test('browser_evaluate_js reports cancellation instead of a browser failure', as
     },
   } as any;
 
-  const tool = createBrowserEvaluateJsTool(broker);
+  const tool = createBrowserRunJsTool(broker);
   const controller = new AbortController();
-  const pending = tool.execute('call-1', { tab_id: 7, expression: 'document.title' }, controller.signal);
+  const pending = tool.execute('call-1', { tab_id: 7, code: 'return document.title;' }, controller.signal);
   setTimeout(() => controller.abort(), 20);
 
   const result: any = await pending;

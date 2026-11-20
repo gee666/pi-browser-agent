@@ -5,12 +5,10 @@ import type { ResponseFrame } from '../../src/broker/protocol.ts';
 import {
   browserClearSiteDataDefinition,
   browserCreateTabDefinition,
-  browserEvaluateJsDefinition,
   browserRunJsDefinition,
   createBrowserClearSiteDataTool,
   createBrowserCloseTabTool,
   createBrowserCreateTabTool,
-  createBrowserEvaluateJsTool,
   createBrowserJsNavigationToolFamily,
   createBrowserNavigateTool,
   createBrowserReloadExtensionTool,
@@ -19,13 +17,11 @@ import {
   createBrowserSwitchTabTool,
 } from '../../src/tools/browser_js_navigation_tools.ts';
 
-test('JavaScript tools disclose AI translation and native-only input instead of arbitrary page execution', () => {
-  for (const definition of [browserEvaluateJsDefinition, browserRunJsDefinition]) {
-    assert.match(definition.description, /configured browser AI model/);
-    assert.match(definition.description, /CDP or Python/);
-    assert.match(definition.description, /Unsupported/);
-    assert.match(definition.description, /off-screen/);
-  }
+test('browser_run_js discloses AI translation and native-only input instead of arbitrary page execution', () => {
+  assert.match(browserRunJsDefinition.description, /configured browser AI model/);
+  assert.match(browserRunJsDefinition.description, /CDP or Python/);
+  assert.match(browserRunJsDefinition.description, /Unsupported/);
+  assert.match(browserRunJsDefinition.description, /off-screen/);
 });
 
 function textOf(result: any): string {
@@ -67,13 +63,12 @@ test('tool family builders expose all expected JS/navigation/destructive tools',
     'browser_reload_extension',
     'browser_clear_site_data',
   ]);
-  assert.equal('url' in (browserEvaluateJsDefinition.parameters as any).properties, false);
   assert.equal('url' in (browserRunJsDefinition.parameters as any).properties, false);
   assert.equal('url' in (browserCreateTabDefinition.parameters as any).properties, true);
   assert.equal((browserClearSiteDataDefinition.parameters as any).properties.types.minItems, 1);
 });
 
-test('legacy browser_evaluate_js forwards timeout-aware requests, uses the explicit tab, and truncates large payloads', async () => {
+test('browser_run_js forwards timeout-aware requests, uses the explicit tab, and truncates large payloads', async () => {
   let captured: { type: string; params: any; timeoutMs?: number } | null = null;
   const broker = createBrokerStub(async (type, params, options) => {
     captured = { type, params, timeoutMs: options.timeoutMs };
@@ -86,13 +81,13 @@ test('legacy browser_evaluate_js forwards timeout-aware requests, uses the expli
     };
   });
 
-  const tool = createBrowserEvaluateJsTool(broker);
-  const result = await tool.execute('call-1', { tab_id: 7, expression: 'document.title', timeout_ms: 1234 });
+  const tool = createBrowserRunJsTool(broker);
+  const result = await tool.execute('call-1', { tab_id: 7, code: 'return document.title;', timeout_ms: 1234 });
 
   const recorded = captured as any;
   assert.ok(recorded);
-  assert.equal(recorded.type, 'browser_evaluate_js');
-  assert.equal(recorded.params.expression, 'document.title');
+  assert.equal(recorded.type, 'browser_run_js');
+  assert.equal(recorded.params.code, 'return document.title;');
   assert.equal(recorded.params.tab_id, 7);
   assert.equal(recorded.timeoutMs, 2234);
   assert.equal(result.details.ok, true);
@@ -106,9 +101,8 @@ test('script transport defaults allow 120 seconds for AI translation plus bridge
     budgets.push(options.timeoutMs ?? 0);
     return { v: 1, kind: 'response', id: 'script-budget', ok: true, data: { tabId: 7, value: 1 } };
   });
-  await createBrowserEvaluateJsTool(broker).execute('evaluate-budget', { tab_id: 7, expression: '1' });
   await createBrowserRunJsTool(broker).execute('program-budget', { tab_id: 7, code: 'return 1;' });
-  assert.deepEqual(budgets, [121_000, 121_000]);
+  assert.deepEqual(budgets, [121_000]);
 });
 
 test('browser_run_js returns structured bridge failures instead of throwing', async () => {

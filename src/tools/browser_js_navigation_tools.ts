@@ -105,9 +105,7 @@ function createSuccessText(name: string, data: any, spill?: { text: string; trun
               ? `Cleared site data for ${data?.origin ?? 'unknown origin'}.`
               : name === 'browser_reload_extension'
                 ? `Reloaded browser extension ${data?.extensionId ?? 'unknown'}.`
-                : name === 'browser_evaluate_js'
-                  ? `Evaluated JavaScript in tab ${data?.tabId ?? 'unknown'}.`
-                  : `Ran JavaScript in tab ${data?.tabId ?? 'unknown'}.`;
+                : `Ran JavaScript in tab ${data?.tabId ?? 'unknown'}.`;
 
   if (!spill) {
     return headline;
@@ -129,7 +127,6 @@ function validateSuccessPayload(name: string, data: any): { code: string; messag
     'browser_switch_tab',
     'browser_close_tab',
     'browser_reload',
-    'browser_evaluate_js',
     'browser_run_js',
   ]);
   if (needsTabId.has(name) && typeof (data as any).tabId !== 'number') {
@@ -247,20 +244,6 @@ function createRequestTool(options: {
     },
   });
 }
-
-export const browserEvaluateJsDefinition = {
-  name: 'browser_evaluate_js',
-  description: 'Translate a JavaScript expression with the configured browser AI model, then execute its validated native-input/read plan. Clicks, typing, keys and scrolling use the input backend selected in extension settings, either CDP or Python, with off-screen targets scrolled into view first. Unsupported JavaScript is rejected, never executed directly. Requires a configured browser AI provider.',
-  promptSnippet: 'Translate a JavaScript expression into validated native input and page reads.',
-  parameters: Type.Object({
-    tab_id: tabIdSchema(),
-    expression: Type.String({ minLength: 1 }),
-    await_promise: Type.Optional(Type.Boolean({ default: true })),
-    return_by_value: Type.Optional(Type.Boolean({ default: true })),
-    world: Type.Optional(Type.Literal('main', { default: 'main' })),
-    timeout_ms: Type.Optional(Type.Number({ minimum: 1, default: 120_000 })),
-  }),
-} as const;
 
 export const browserRunJsDefinition = {
   name: 'browser_run_js',
@@ -381,12 +364,6 @@ export const browserClearSiteDataDefinition = {
     ]), { minItems: 1 })),
   }),
 } as const;
-
-// Legacy programmatic entry point; not advertised or registered as a Pi tool.
-export const createBrowserEvaluateJsTool = createRequestTool({
-  ...browserEvaluateJsDefinition,
-  timeoutFromParams: (params) => Number(params.timeout_ms ?? 120_000) + 1_000,
-});
 
 export const createBrowserRunJsTool = createRequestTool({
   ...browserRunJsDefinition,

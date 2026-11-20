@@ -5,7 +5,7 @@
  * signal, ...)` in pi's extension API) and fires it when the user presses
  * Escape. Before this module nothing in this package listened to that signal,
  * so an aborted call stayed pending inside `broker.request()` until its own
- * timeout expired — up to 15s for browser_evaluate_js, 30s for browser_run_js
+ * timeout expired — up to 120s for browser_run_js
  * and longer for navigation waits. Escape looked like it did nothing.
  *
  * Everything here is host-side only: it releases pi immediately and drops the
