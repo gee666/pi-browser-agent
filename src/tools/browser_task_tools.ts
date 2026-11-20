@@ -7,6 +7,7 @@ import type { ResponseFrame } from '../broker/protocol.ts';
 import { formatBridgeFailure } from '../broker/diagnostics.ts';
 import { assertValidTaskId, TaskCorruptionError, type TaskStoreEntry } from '../broker/task-store.ts';
 import { ABORT_ERROR_CODE, isAbortError } from '../broker/abort.ts';
+import { assertExplicitTabTarget, tabIdSchema, type TabTargetError } from './tab-target.ts';
 
 interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -197,22 +198,32 @@ export function createBrowserRunTaskTool(broker: BrowserAgentBroker) {
   return {
     name: 'browser_run_task',
     label: 'browser_run_task',
-    description: 'Run a browser task end-to-end. The task may be described in natural English. Defaults to the active browser tab; pass tab_id for deterministic targeting.',
-    promptSnippet: 'Run a browser task in the active or explicitly targeted tab.',
+    description: 'Run a browser task end-to-end. The task may be described in natural English. Requires an explicit tab_id; the active tab is never used implicitly.',
+    promptSnippet: 'Run a browser task in the tab given by tab_id.',
     parameters: Type.Object({
       task: Type.String({ minLength: 1 }),
-      tab_id: Type.Optional(Type.Number()),
-      use_active_tab: Type.Optional(Type.Boolean()),
+      tab_id: tabIdSchema(),
       debugMode: Type.Optional(Type.Boolean()),
       timeoutMs: Type.Optional(Type.Number({ minimum: 1 })),
     }),
     async execute(
       _toolCallId: string,
-      params: { task: string; tab_id?: number; use_active_tab?: boolean; debugMode?: boolean; timeoutMs?: number },
+      params: { task: string; tab_id: number; debugMode?: boolean; timeoutMs?: number },
       signal?: AbortSignal,
     ): Promise<ToolResult> {
       // Lazily (re)acquire the broker so a killed primary is replaced on demand,
       // and wait out the extension's reconnect window before deciding we are down.
+      try {
+        assertExplicitTabTarget('browser_run_task', params);
+      } catch (error) {
+        const { code, message } = error as TabTargetError;
+        return textResult(`browser_run_task failed: ${message}`, {
+          ok: false,
+          success: false,
+          status: 'error',
+          error: { code, message },
+        });
+      }
       await broker.ensureReady?.({ signal });
       if (signal?.aborted) {
         return textResult('browser_run_task cancelled before the task was started.', {
@@ -240,14 +251,11 @@ export function createBrowserRunTaskTool(broker: BrowserAgentBroker) {
 
       const taskId = randomUUID();
       const startedAt = Date.now();
-      const target = typeof params.tab_id === 'number'
-        ? { tab_id: params.tab_id }
-        : { use_active_tab: params.use_active_tab ?? true };
       const request = {
         taskId,
         task: params.task,
         debugMode: params.debugMode ?? false,
-        ...target,
+        tab_id: params.tab_id,
       };
 
       await appendSafe(broker, taskId, {

@@ -4,6 +4,7 @@ import { Type } from 'typebox';
 
 import type { BrowserAgentBroker } from '../../broker/server.ts';
 import { isAbortError } from '../../broker/abort.ts';
+import { tabIdSchema } from '../tab-target.ts';
 import {
   BrowserReadOnlyToolError,
   type ReadOnlyToolDefinition,
@@ -111,9 +112,7 @@ function createScreenshotTool(broker: BrowserAgentBroker): ReadOnlyToolDefinitio
       'Capture a compressed browser screenshot. Prefer selector/full_page options only when you need them. Large screenshots are spilled to a temp file and the file path is returned.',
     promptSnippet: 'Capture a browser screenshot.',
     parameters: Type.Object({
-      url: Type.Optional(Type.String({ minLength: 1 })),
-      tab_id: Type.Optional(Type.Number()),
-      use_active_tab: Type.Optional(Type.Boolean()),
+      tab_id: tabIdSchema(),
       full_page: Type.Optional(Type.Boolean()),
       selector: Type.Optional(Type.String({ minLength: 1 })),
       wait_until: Type.Optional(waitUntilType()),
@@ -189,9 +188,7 @@ function createHtmlTool(broker: BrowserAgentBroker): ReadOnlyToolDefinition<any>
       'Extract HTML from a page. Prefer a CSS selector to return only the subtree you need. If the output is large, it is truncated and the full HTML is written to a temp file.',
     promptSnippet: 'Get rendered HTML from the browser.',
     parameters: Type.Object({
-      url: Type.Optional(Type.String({ minLength: 1 })),
-      tab_id: Type.Optional(Type.Number()),
-      use_active_tab: Type.Optional(Type.Boolean()),
+      tab_id: tabIdSchema(),
       selector: Type.Optional(Type.String({ minLength: 1 })),
       selector_all: Type.Optional(Type.Boolean()),
       rendered: Type.Optional(Type.Boolean()),
@@ -213,7 +210,7 @@ function createHtmlTool(broker: BrowserAgentBroker): ReadOnlyToolDefinition<any>
           );
         }
         const html = typeof data?.html === 'string' ? data.html : (data.content as string);
-        const formatted = await formatTextResult(`HTML for ${data?.url || params.url || 'current page'}`, html, 'html');
+        const formatted = await formatTextResult(`HTML for ${data?.url || 'tab ' + params.tab_id}`, html, 'html');
         return textResult(formatted.text, {
           ok: true,
           requestType: 'browser_get_html',
@@ -246,11 +243,11 @@ export function createReadOnlyBrowserTools(broker: BrowserAgentBroker): ReadOnly
         'Inspect DOM details for matching elements. Prefer a specific selector and narrow include fields. Supported include values: attributes, rect, textContent, innerHTML, accessibility, visibility, event_listeners, outer_html. Aliases also accepted: text -> textContent, html -> innerHTML, boundingBox -> rect. Large results are truncated and spilled to a temp file.',
       promptSnippet: 'Inspect DOM details for selected elements.',
       parameters: Type.Object({
-        url: Type.Optional(Type.String({ minLength: 1 })),
+        tab_id: tabIdSchema(),
         selector: Type.String({ minLength: 1 }),
         selector_all: Type.Optional(Type.Boolean()),
         limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
-        include: Type.Optional(includeType(['attributes', 'rect', 'textContent', 'innerHTML', 'accessibility', 'visibility', 'event_listeners', 'outer_html', 'text', 'html', 'boundingBox'])),},{
+        include: Type.Optional(includeType(['attributes', 'rect', 'textContent', 'innerHTML', 'accessibility', 'visibility', 'event_listeners', 'outer_html', 'text', 'html', 'boundingBox'])),
       }),
       title: (_data, params) => `DOM info for selector ${String((params as any).selector)}`,
     }),
@@ -261,7 +258,7 @@ export function createReadOnlyBrowserTools(broker: BrowserAgentBroker): ReadOnly
         'Read computed CSS styles. Prefer listing only the properties you need. Large results are truncated and spilled to a temp file.',
       promptSnippet: 'Read computed CSS styles for a selector.',
       parameters: Type.Object({
-        url: Type.Optional(Type.String({ minLength: 1 })),
+        tab_id: tabIdSchema(),
         selector: Type.String({ minLength: 1 }),
         properties: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
         pseudo: Type.Optional(Type.String({ minLength: 1 })),
@@ -286,8 +283,7 @@ export function createReadOnlyBrowserTools(broker: BrowserAgentBroker): ReadOnly
       description: 'Wait for a selector, text, or URL condition. Returns the matched condition and timing details.',
       promptSnippet: 'Wait for a page condition.',
       parameters: Type.Object({
-        url: Type.Optional(Type.String({ minLength: 1 })),
-        tab_id: Type.Optional(Type.Number()),
+        tab_id: tabIdSchema(),
         selector: Type.Optional(Type.String({ minLength: 1 })),
         text: Type.Optional(Type.String({ minLength: 1 })),
         url_matches: Type.Optional(Type.String({ minLength: 1 })),
@@ -307,7 +303,7 @@ export function createReadOnlyBrowserTools(broker: BrowserAgentBroker): ReadOnly
         'Read the accessibility tree. Prefer a root selector or include filters when possible. Large trees are truncated and spilled to a temp file.',
       promptSnippet: 'Read the accessibility tree.',
       parameters: Type.Object({
-        url: Type.Optional(Type.String({ minLength: 1 })),
+        tab_id: tabIdSchema(),
         root_selector: Type.Optional(Type.String({ minLength: 1 })),
         interesting_only: Type.Optional(Type.Boolean()),
         max_depth: Type.Optional(Type.Number({ minimum: 1 })),
@@ -321,7 +317,7 @@ export function createReadOnlyBrowserTools(broker: BrowserAgentBroker): ReadOnly
       description: 'Read performance metrics, timing, layout, memory, paint, and optional web-vitals data.',
       promptSnippet: 'Read browser performance metrics.',
       parameters: Type.Object({
-        url: Type.Optional(Type.String({ minLength: 1 })),
+        tab_id: tabIdSchema(),
         include: Type.Optional(includeType(['metrics', 'timing', 'web_vitals', 'layout', 'memory', 'paint'])),
       }),
       title: () => 'Performance metrics',

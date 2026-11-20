@@ -96,7 +96,7 @@ test('browser_run_task preserves a manual CAPTCHA pause without claiming complet
   });
   try {
     const tools = createToolHarness(broker);
-    const result = await tools.get('browser_run_task').execute('manual-captcha', { task: 'Open the form' });
+    const result = await tools.get('browser_run_task').execute('manual-captcha', { tab_id: 7, task: 'Open the form' });
     assert.equal(result.details.ok, true);
     assert.equal(result.details.success, false);
     assert.equal(result.details.status, 'paused');
@@ -110,7 +110,7 @@ test('browser_run_task preserves a manual CAPTCHA pause without claiming complet
   }
 });
 
-test('browser_run_task happy path targets the active tab and records useful history', async () => {
+test('browser_run_task happy path targets an explicit tab and records useful history', async () => {
   const { broker } = await createBroker();
   let receivedRequest: any;
   const socket = await connectBridge(broker, async (frame, ws) => {
@@ -135,7 +135,7 @@ test('browser_run_task happy path targets the active tab and records useful hist
   const tools = createToolHarness(broker);
 
   try {
-    const runResult = await tools.get('browser_run_task').execute('call-1', { task: 'Open example.com' });
+    const runResult = await tools.get('browser_run_task').execute('call-1', { tab_id: 7, task: 'Open example.com' });
     assert.match(textOf(runResult), /completed/i);
     assert.match(textOf(runResult), /Success: yes/i);
     assert.match(textOf(runResult), /History summary:/i);
@@ -143,14 +143,14 @@ test('browser_run_task happy path targets the active tab and records useful hist
     assert.equal(runResult.details.success, true);
     assert.equal(runResult.details.status, 'done');
     assert.equal(runResult.details.historySummary.steps, 2);
-    assert.equal(receivedRequest.use_active_tab, true);
-    assert.equal(receivedRequest.tab_id, undefined);
+    assert.equal(receivedRequest.tab_id, 7);
+    assert.equal(receivedRequest.use_active_tab, undefined);
     const taskId = String(runResult.details.taskId);
 
     const historyResult = await tools.get('browser_get_task_history').execute('call-2', { taskId });
     assert.equal(historyResult.details.ok, true);
     assert.equal(historyResult.details.history.length, 2);
-    assert.equal(historyResult.details.history[0].request.use_active_tab, true);
+    assert.equal(historyResult.details.history[0].request.tab_id, 7);
     assert.equal(historyResult.details.summary.status, 'done');
 
     const listResult = await tools.get('browser_list_tasks').execute('call-3', { limit: 10 });
@@ -226,10 +226,10 @@ test('concurrent browser_run_task attempts return E_BUSY without crashing the ca
   const tools = createToolHarness(broker);
 
   try {
-    const firstRun = tools.get('browser_run_task').execute('call-1', { task: 'Task one' });
+    const firstRun = tools.get('browser_run_task').execute('call-1', { tab_id: 7, task: 'Task one' });
     await entered;
 
-    const secondRun = await tools.get('browser_run_task').execute('call-2', { task: 'Task two' });
+    const secondRun = await tools.get('browser_run_task').execute('call-2', { tab_id: 7, task: 'Task two' });
     assert.equal(secondRun.details.ok, false);
     assert.equal(secondRun.details.error.code, 'E_BUSY');
     assert.match(textOf(secondRun), /rejected/i);
@@ -276,7 +276,7 @@ test('browser_run_task treats runtime error payloads as failures instead of succ
   const tools = createToolHarness(broker);
 
   try {
-    const result = await tools.get('browser_run_task').execute('call-1', { task: 'Fail please' });
+    const result = await tools.get('browser_run_task').execute('call-1', { tab_id: 7, task: 'Fail please' });
     assert.equal(result.details.ok, false);
     assert.equal(result.details.status, 'error');
     assert.equal(result.details.error.code, 'E_RUNTIME');
@@ -319,7 +319,7 @@ test('browser_run_task rejects malformed success payloads without a recognized t
   const tools = createToolHarness(broker);
 
   try {
-    const result = await tools.get('browser_run_task').execute('call-1', { task: 'Malformed payload' });
+    const result = await tools.get('browser_run_task').execute('call-1', { tab_id: 7, task: 'Malformed payload' });
     assert.equal(result.details.ok, false);
     assert.equal(result.details.status, 'error');
     assert.equal(result.details.error.code, 'E_PROTOCOL');
@@ -399,7 +399,7 @@ test('browser_run_task surfaces bridge disconnect as a structured error result',
   const tools = createToolHarness(broker);
 
   try {
-    const result = await tools.get('browser_run_task').execute('call-1', { task: 'Disconnect me' });
+    const result = await tools.get('browser_run_task').execute('call-1', { tab_id: 7, task: 'Disconnect me' });
     assert.equal(result.details.ok, false);
     assert.equal(result.details.status, 'error');
     assert.equal(result.details.error.code, 'E_BRIDGE_DISCONNECTED');

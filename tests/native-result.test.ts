@@ -60,7 +60,7 @@ test('every registered browser implementation declares native output and preserv
     for (const name of ['browser_list_tabs', 'browser_get_html', 'browser_get_console_logs', 'browser_run_task']) {
       const tool = tools.find((item) => item.name === name);
       assert.ok(tool && typeof tool.execute === 'function');
-      const result = await Reflect.apply(tool.execute, undefined, ['call', { task: 'sentinel' }, undefined]);
+      const result = await Reflect.apply(tool.execute, undefined, ['call', { task: 'sentinel', tab_id: 7 }, undefined]);
       assert.equal(result.isError, true, name);
       assert.deepEqual(result.structuredContent, JSON.parse(JSON.stringify(result.details)), name);
       assert.match(JSON.stringify(result.content), /bridge|broker/i);

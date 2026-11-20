@@ -71,7 +71,7 @@ test('global Pi declares all tools offline, forwards tasks, persists history acr
   const port = await freePort();
   const requests: RecordValue[] = [];
   let selectedTool = 'browser_run_task';
-  let selectedParams: RecordValue = { task: 'EVERGREEN_TASK_INTENT' };
+  let selectedParams: RecordValue = { task: 'EVERGREEN_TASK_INTENT', tab_id: 7 };
   let bridgeFailure = false;
   const bridges = new Set<WebSocket>();
   // A local transport fixture makes declaration/result assertions deterministic;
@@ -118,6 +118,7 @@ test('global Pi declares all tools offline, forwards tasks, persists history acr
       if (frame.kind !== 'request') return;
       assert.equal(frame.type, 'browser_run_task');
       assert.equal(object(frame.params).task, 'EVERGREEN_TASK_INTENT');
+      assert.equal(object(frame.params).tab_id, 7);
       bridge.send(JSON.stringify({ v: 1, kind: 'response', id: frame.id, ok: !bridgeFailure,
         ...(bridgeFailure ? { error: { code: 'E_RUNTIME', message: 'EVERGREEN_BRIDGE_FAILURE' } }
           : { data: { status: 'done', message: 'EVERGREEN_BRIDGE_RESULT' } }) }));
@@ -139,7 +140,7 @@ test('global Pi declares all tools offline, forwards tasks, persists history acr
     assert.match(JSON.stringify(toolEnd(history, selectedTool)), /EVERGREEN_BRIDGE_RESULT/);
     assert.match(JSON.stringify(requests.at(-1)), /Loaded 2 history event/);
     selectedTool = 'browser_run_task';
-    selectedParams = { task: 'EVERGREEN_TASK_INTENT' };
+    selectedParams = { task: 'EVERGREEN_TASK_INTENT', tab_id: 7 };
     bridgeFailure = true;
     const failed = toolEnd(await runPi(dir, port, 'evergreen/evergreen-fixture', 'Run the task.'), selectedTool);
     assert.equal(failed.isError, true);

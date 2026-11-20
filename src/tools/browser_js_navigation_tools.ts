@@ -4,6 +4,7 @@ import type { ProbeResult } from '../broker/protocol.ts';
 import type { BrowserAgentBroker } from '../broker/server.ts';
 import { formatBridgeFailure } from '../broker/diagnostics.ts';
 import { truncateAndSpill } from '../util/truncate.ts';
+import { assertExplicitTabTarget, tabIdSchema } from './tab-target.ts';
 import { abortError, isAbortError, sleepUnlessAborted } from '../broker/abort.ts';
 
 interface ToolResult {
@@ -40,6 +41,7 @@ async function brokerToolRequest(
   signal?: AbortSignal,
 ): Promise<{ ok: true; data: unknown } | { ok: false; error: { code: string; message: string; details?: unknown } }> {
   try {
+    assertExplicitTabTarget(type, params);
     // Cancellation can arrive before we touch the broker at all.
     if (signal?.aborted) throw abortError(type, signal);
     // Lazily (re)acquire the broker (and wait out the extension's reconnect
@@ -85,34 +87,6 @@ async function formatPayload(payload: unknown, ext: 'txt' | 'json' = 'json') {
 
 function createToolDescription(summary: string): string {
   return `${summary} If the returned payload is large, it is truncated and the full result is written to a temp file whose path is included in the response.`;
-}
-
-function withDefaultActiveTabTarget(params: Record<string, unknown>) {
-  if (typeof params.tab_id === 'number' || params.use_active_tab === true) {
-    return params;
-  }
-  return {
-    ...params,
-    use_active_tab: true,
-  };
-}
-
-// browser_clear_site_data accepts explicit origin/url targets. If either is
-// supplied, do not inject use_active_tab — that would send conflicting
-// selectors to the bridge and risk clearing the wrong site's data.
-function withClearSiteDataTarget(params: Record<string, unknown>) {
-  if (
-    typeof params.tab_id === 'number'
-    || params.use_active_tab === true
-    || typeof params.origin === 'string'
-    || typeof params.url === 'string'
-  ) {
-    return params;
-  }
-  return {
-    ...params,
-    use_active_tab: true,
-  };
 }
 
 function createSuccessText(name: string, data: any, spill?: { text: string; truncated: boolean; fullOutputPath?: string }) {
@@ -231,16 +205,10 @@ function createRequestTool(options: {
       params: Record<string, unknown>,
       signal?: AbortSignal,
     ): Promise<ToolResult> {
-      const requestParams = options.name === 'browser_clear_site_data'
-        ? withClearSiteDataTarget(params)
-        : [
-          'browser_evaluate_js',
-          'browser_run_js',
-          'browser_navigate',
-          'browser_reload',
-        ].includes(options.name)
-          ? withDefaultActiveTabTarget(params)
-          : params;
+      // New tabs open in the background; the user's focused tab is only changed by browser_switch_tab.
+      const requestParams = options.name === 'browser_create_tab'
+        ? { ...params, active: params.active ?? false }
+        : params;
 
       const outcome = await brokerToolRequest(
         broker,
@@ -285,8 +253,7 @@ export const browserEvaluateJsDefinition = {
   description: 'Translate a JavaScript expression with the configured browser AI model, then execute its validated native-input/read plan. Clicks, typing, keys and scrolling use the input backend selected in extension settings, either CDP or Python, with off-screen targets scrolled into view first. Unsupported JavaScript is rejected, never executed directly. Requires a configured browser AI provider.',
   promptSnippet: 'Translate a JavaScript expression into validated native input and page reads.',
   parameters: Type.Object({
-    tab_id: Type.Optional(Type.Number()),
-    use_active_tab: Type.Optional(Type.Boolean()),
+    tab_id: tabIdSchema(),
     expression: Type.String({ minLength: 1 }),
     await_promise: Type.Optional(Type.Boolean({ default: true })),
     return_by_value: Type.Optional(Type.Boolean({ default: true })),
@@ -300,8 +267,7 @@ export const browserRunJsDefinition = {
   description: 'Translate a JavaScript program with the configured browser AI model, then execute its validated native-input/read plan. All input uses the backend selected in extension settings, either CDP or Python; off-screen targets are scrolled into view first. Supports a bounded set of actions and reads, not arbitrary page JavaScript. Unsupported code fails without direct JavaScript execution.',
   promptSnippet: 'Translate JavaScript into validated native input and page reads.',
   parameters: Type.Object({
-    tab_id: Type.Optional(Type.Number()),
-    use_active_tab: Type.Optional(Type.Boolean()),
+    tab_id: tabIdSchema(),
     code: Type.String({ minLength: 1 }),
     args: Type.Optional(Type.Array(Type.Unknown())),
     return_by_value: Type.Optional(Type.Boolean({ default: true })),
@@ -313,7 +279,7 @@ export const browserRunJsDefinition = {
 
 export const browserCreateTabDefinition = {
   name: 'browser_create_tab',
-  description: 'Create a new browser tab and return its tab id for later browser tool calls.',
+  description: 'Create a new browser tab in the background (it does not take focus unless active=true) and return its tab id; pass that tab_id to later browser tool calls.',
   promptSnippet: 'Create a new browser tab for isolated browser work. Use the returned tab_id in later browser tool calls.',
   parameters: Type.Object({
     url: Type.Optional(Type.String({ format: 'uri', minLength: 1 })),
@@ -332,12 +298,11 @@ export const browserCreateTabDefinition = {
 
 export const browserNavigateDefinition = {
   name: 'browser_navigate',
-  description: 'Navigate a browser tab to a URL and wait for it to settle.',
+  description: 'Navigate the tab given by tab_id to a URL and wait for it to settle. Never targets the active tab implicitly.',
   promptSnippet: 'Navigate a browser tab to a URL.',
   parameters: Type.Object({
+    tab_id: tabIdSchema(),
     url: Type.String({ format: 'uri', minLength: 1 }),
-    tab_id: Type.Optional(Type.Number()),
-    use_active_tab: Type.Optional(Type.Boolean()),
     wait_until: Type.Optional(Type.Union([
       Type.Literal('load'),
       Type.Literal('networkidle'),
@@ -350,10 +315,10 @@ export const browserNavigateDefinition = {
 
 export const browserSwitchTabDefinition = {
   name: 'browser_switch_tab',
-  description: 'Activate a browser tab and optionally wait for it to settle.',
+  description: 'Explicitly focus the tab given by tab_id and optionally wait for it to settle. This is the only way to change the focused tab besides browser_create_tab with active=true.',
   promptSnippet: 'Switch to a browser tab.',
   parameters: Type.Object({
-    tab_id: Type.Number(),
+    tab_id: tabIdSchema(),
     wait_until: Type.Optional(Type.Union([
       Type.Literal('load'),
       Type.Literal('networkidle'),
@@ -369,7 +334,7 @@ export const browserCloseTabDefinition = {
   description: 'Close a browser tab.',
   promptSnippet: 'Close a browser tab.',
   parameters: Type.Object({
-    tab_id: Type.Number(),
+    tab_id: tabIdSchema(),
   }),
 } as const;
 
@@ -378,8 +343,7 @@ export const browserReloadDefinition = {
   description: 'Reload a browser tab.',
   promptSnippet: 'Reload a browser tab.',
   parameters: Type.Object({
-    tab_id: Type.Optional(Type.Number()),
-    use_active_tab: Type.Optional(Type.Boolean()),
+    tab_id: tabIdSchema(),
     bypass_cache: Type.Optional(Type.Boolean({ default: false })),
     wait_until: Type.Optional(Type.Union([
       Type.Literal('load'),
@@ -407,8 +371,7 @@ export const browserClearSiteDataDefinition = {
   parameters: Type.Object({
     url: Type.Optional(Type.String({ format: 'uri' })),
     origin: Type.Optional(Type.String({ format: 'uri' })),
-    tab_id: Type.Optional(Type.Number()),
-    use_active_tab: Type.Optional(Type.Boolean()),
+    tab_id: tabIdSchema(),
     types: Type.Optional(Type.Array(Type.Union([
       Type.Literal('cookies'),
       Type.Literal('local_storage'),

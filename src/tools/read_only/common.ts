@@ -11,6 +11,7 @@ import type { ResponseFrame } from '../../broker/protocol.ts';
 import { formatBridgeFailure } from '../../broker/diagnostics.ts';
 import { truncateAndSpill } from '../../util/truncate.ts';
 import { abortError, isAbortError, type BrokerRequestOptions } from '../../broker/abort.ts';
+import { assertExplicitTabTarget } from '../tab-target.ts';
 
 const SCREENSHOT_TEMP_DIR = join(tmpdir(), 'pi-browser-agent', 'screenshots');
 const SCREENSHOT_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -118,6 +119,11 @@ export async function requestBridge<TData>(
   options: BrokerRequestOptions = {},
 ): Promise<{ response: ResponseFrame; data: TData }> {
   const { signal } = options;
+  try {
+    assertExplicitTabTarget(type, params);
+  } catch (error) {
+    throw coerceError(error);
+  }
   if (signal?.aborted) throw coerceError(abortError(type, signal));
   // Lazily (re)acquire the broker before the readiness check so a killed
   // primary is replaced (or reconnected to) on this request instead of failing.

@@ -10,17 +10,8 @@ import {
   textResult,
 } from './read_only/common.ts';
 import { isAbortError } from '../broker/abort.ts';
+import { tabIdSchema } from './tab-target.ts';
 import type { ToolResult } from './read_only/common.ts';
-
-function withDefaultActiveTabTarget(params: Record<string, unknown>) {
-  if (typeof params.tab_id === 'number' || typeof params.url === 'string' || params.use_active_tab === true) {
-    return params;
-  }
-  return {
-    ...params,
-    use_active_tab: true,
-  };
-}
 
 function consoleLogText(details: any) {
   return [
@@ -43,12 +34,10 @@ export function createBrowserGetConsoleLogsTool(broker: BrowserAgentBroker) {
     name: 'browser_get_console_logs',
     label: 'browser_get_console_logs',
     description:
-      'Read buffered browser console logs. If you do not pass tab_id or url, this tool defaults to the active tab. Prefer passing filters such as levels, substring, regex, since, or last to narrow the result. If the output is large, it is truncated and the full result is written to a temp file whose path is included in the response.',
+      'Read buffered browser console logs. Requires an explicit tab_id. Prefer passing filters such as levels, substring, regex, since, or last to narrow the result. If the output is large, it is truncated and the full result is written to a temp file whose path is included in the response.',
     promptSnippet: 'Read filtered browser console logs.',
     parameters: Type.Object({
-      tab_id: Type.Optional(Type.Number()),
-      url: Type.Optional(Type.String()),
-      use_active_tab: Type.Optional(Type.Boolean()),
+      tab_id: tabIdSchema(),
       levels: Type.Optional(Type.Array(Type.Union([
         Type.Literal('log'), Type.Literal('info'), Type.Literal('warn'), Type.Literal('error'), Type.Literal('debug'),
       ]))),
@@ -65,7 +54,7 @@ export function createBrowserGetConsoleLogsTool(broker: BrowserAgentBroker) {
       params: Record<string, unknown>,
       signal?: AbortSignal,
     ): Promise<ToolResult> {
-      const requestParams = withDefaultActiveTabTarget(params);
+      const requestParams = params;
       try {
         const { data } = await requestBridge<Record<string, unknown>>(broker, 'browser_get_console_logs', requestParams, {
           timeoutMs: Number(requestParams.timeout_ms || defaultTimeoutMs('browser_get_console_logs')),
@@ -102,12 +91,10 @@ export function createBrowserGetNetworkTool(broker: BrowserAgentBroker) {
     name: 'browser_get_network',
     label: 'browser_get_network',
     description:
-      'Read buffered browser network activity. If you do not pass tab_id or url, this tool defaults to the active tab. Always pass filters such as status, type, url_contains, failed_only, since, or last, because unfiltered results may be large. Use include_request_body or include_response_body only when needed; bodies are size-capped. Large output is truncated and the full result is written to a temp file whose path is included in the response.',
+      'Read buffered browser network activity. Requires an explicit tab_id. Always pass filters such as status, type, url_contains, failed_only, since, or last, because unfiltered results may be large. Use include_request_body or include_response_body only when needed; bodies are size-capped. Large output is truncated and the full result is written to a temp file whose path is included in the response.',
     promptSnippet: 'Read filtered browser network activity.',
     parameters: Type.Object({
-      tab_id: Type.Optional(Type.Number()),
-      url: Type.Optional(Type.String()),
-      use_active_tab: Type.Optional(Type.Boolean()),
+      tab_id: tabIdSchema(),
       filter: Type.Optional(Type.Object({
         method: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())])),
         status: Type.Optional(Type.Union([Type.Number(), Type.Array(Type.Number())])),
@@ -137,7 +124,7 @@ export function createBrowserGetNetworkTool(broker: BrowserAgentBroker) {
       params: Record<string, unknown>,
       signal?: AbortSignal,
     ): Promise<ToolResult> {
-      const requestParams = withDefaultActiveTabTarget(params);
+      const requestParams = params;
       try {
         const { data } = await requestBridge<Record<string, unknown>>(broker, 'browser_get_network', requestParams, {
           timeoutMs: Number(requestParams.timeout_ms || defaultTimeoutMs('browser_get_network')),

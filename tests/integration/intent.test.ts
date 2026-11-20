@@ -77,8 +77,7 @@ async function freePort(): Promise<number> {
 
 interface Scenario {
   task: string;
-  params: { tab_id?: number; use_active_tab?: boolean; debugMode?: boolean; timeoutMs: number };
-  target: { tab_id: number } | { use_active_tab: boolean };
+  params: { tab_id: number; debugMode?: boolean; timeoutMs: number };
   reply: Pick<ResponseFrame, 'ok' | 'data' | 'error'>;
   status: string;
   code?: string;
@@ -86,9 +85,8 @@ interface Scenario {
 
 const scenarios: Scenario[] = [
   {
-    task: 'Read the active page',
-    params: { timeoutMs: 2_000 },
-    target: { use_active_tab: true },
+    task: 'Read the selected page',
+    params: { tab_id: 41, timeoutMs: 2_000 },
     reply: {
       ok: true,
       data: { status: 'done', message: 'Read page', historySummary: { steps: 1, text: '1. Read page' } },
@@ -97,32 +95,28 @@ const scenarios: Scenario[] = [
   },
   {
     task: 'Fail on the selected tab',
-    params: { tab_id: 42, use_active_tab: true, debugMode: true, timeoutMs: 3_000 },
-    target: { tab_id: 42 },
+    params: { tab_id: 42, debugMode: true, timeoutMs: 3_000 },
     reply: { ok: true, data: { status: 'error', error: { code: 'E_RUNTIME', message: 'Model failed' } } },
     status: 'error',
     code: 'E_RUNTIME',
   },
   {
     task: 'Reject a busy task',
-    params: { use_active_tab: false, timeoutMs: 2_000 },
-    target: { use_active_tab: false },
+    params: { tab_id: 43, timeoutMs: 2_000 },
     reply: { ok: false, error: { code: 'E_BUSY', message: 'Already running' } },
     status: 'rejected',
     code: 'E_BUSY',
   },
   {
     task: 'Reject a malformed success',
-    params: { timeoutMs: 2_000 },
-    target: { use_active_tab: true },
+    params: { tab_id: 44, timeoutMs: 2_000 },
     reply: { ok: true, data: {} },
     status: 'error',
     code: 'E_PROTOCOL',
   },
   {
     task: 'Report a bridge failure',
-    params: { timeoutMs: 2_000 },
-    target: { use_active_tab: true },
+    params: { tab_id: 45, timeoutMs: 2_000 },
     reply: { ok: false, error: { code: 'E_EXTENSION', message: 'Browser action failed' } },
     status: 'error',
     code: 'E_EXTENSION',
@@ -208,7 +202,7 @@ test('secondary task tools forward through the primary bridge and retain history
       assert.match(result.content[0].text, /History summary:\n1\. Read page/);
     }
     const expectedRequest = {
-      taskId, task: scenario.task, debugMode: scenario.params.debugMode ?? false, ...scenario.target,
+      taskId, task: scenario.task, debugMode: scenario.params.debugMode ?? false, tab_id: scenario.params.tab_id,
     };
     assert.deepEqual(received.at(-1), expectedRequest);
     const history = records(result.details.history);

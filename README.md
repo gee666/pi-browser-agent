@@ -74,6 +74,10 @@ The full toolkit registered for the session is:
 - `browser_wait_for`
 - `browser_clear_site_data`
 
+## Tab targeting
+
+Create a background tab with `browser_create_tab` and pass its returned ID as `tab_id` to each tab-scoped tool. Inspection tools never navigate: call `browser_navigate` with the same `tab_id` first. Use `browser_switch_tab` or `active: true` on creation only when you intend to bring the tab forward. Pi tasks require tab-scoped CDP input. Tab listing, task history, and bridge maintenance do not target a tab.
+
 ## JavaScript input safety
 
 `browser_evaluate_js` and `browser_run_js` send every supplied script to the Chrome extension's configured AI provider. The extension translates source into a validated plan rather than executing it in the page. Clicks, focus, typing, keys, shortcuts and scrolling use the input backend selected in extension settings, either CDP or Python. It scrolls off-screen targets into view before interacting, then reads their coordinates again. CDP works without the Python service installed. Only the Python backend needs that service and can affect the foreground desktop.

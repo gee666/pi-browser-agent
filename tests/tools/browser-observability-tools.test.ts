@@ -50,7 +50,7 @@ test('browser_get_console_logs tool forwards params and returns truncated previe
   assert.match(textOf(result), /Console log query returned 1 entry/);
 });
 
-test('browser_get_console_logs defaults to the active tab when no target is provided', async () => {
+test('browser_get_console_logs rejects requests without an explicit tab', async () => {
   let call: any = null;
   const tool = createBrowserGetConsoleLogsTool(createBroker({
     async request(type: string, params: unknown) {
@@ -59,8 +59,9 @@ test('browser_get_console_logs defaults to the active tab when no target is prov
     },
   }));
 
-  await tool.execute('call-1', { last: 5 });
-  assert.deepEqual(call.params, { last: 5, use_active_tab: true });
+  const result = await tool.execute('call-1', { last: 5 });
+  assert.equal(result.details.ok, false);
+  assert.equal(call, null);
 });
 
 test('browser_get_network tool returns structured error results on bridge failure', async () => {
@@ -70,7 +71,7 @@ test('browser_get_network tool returns structured error results on bridge failur
     },
   }));
 
-  const result = await tool.execute('call-1', { filter: { failed_only: true } });
+  const result = await tool.execute('call-1', { tab_id: 7, filter: { failed_only: true } });
   assert.equal(result.details.ok, false);
   assert.equal((result.details as any).error.code, 'E_BRIDGE_DISCONNECTED');
   assert.equal((result.details as any).error.message, 'socket dropped');
@@ -84,7 +85,7 @@ test('browser_get_console_logs tool returns structured error results on bridge f
     },
   }));
 
-  const result = await tool.execute('call-1', { last: 5 });
+  const result = await tool.execute('call-1', { tab_id: 7, last: 5 });
   assert.equal(result.details.ok, false);
   assert.equal((result.details as any).error.code, 'E_BRIDGE_DISCONNECTED');
   assert.match(textOf(result), /browser_get_console_logs failed: socket dropped/);
@@ -93,8 +94,8 @@ test('browser_get_console_logs tool returns structured error results on bridge f
 test('buffered observability tool-definition builders expose both tools', () => {
   const definitions = createBufferedObservabilityToolDefinitions(createBroker());
   assert.deepEqual(Object.keys(definitions).sort(), ['browser_get_console_logs', 'browser_get_network']);
-  assert.match(definitions.browser_get_network.description, /defaults to the active tab/i);
+  assert.match(definitions.browser_get_network.description, /tab_id/i);
   assert.match(definitions.browser_get_network.description, /Always pass filters/i);
-  assert.match(definitions.browser_get_console_logs.description, /defaults to the active tab/i);
+  assert.match(definitions.browser_get_console_logs.description, /tab_id/i);
   assert.match(definitions.browser_get_console_logs.description, /Prefer passing filters/i);
 });

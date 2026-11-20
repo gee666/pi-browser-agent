@@ -36,6 +36,17 @@ test('read-only tool family exports exactly the planned tool names', () => {
   ]);
 });
 
+test('browser_get_dom_info rejects URL-only and URL-plus-tab reads without sending a bridge request', async () => {
+  const tools = createReadOnlyBrowserToolMap(createBrokerHarness(async () => assert.fail('must not contact bridge')));
+  for (const target of [{}, { tab_id: 7 }]) {
+    const result = await tools.get('browser_get_dom_info')!.execute('invalid-target', {
+      ...target, url: 'https://search.test/', selector: '.result',
+    });
+    assert.equal(result.details.ok, false);
+    assert.equal((result.details.error as any).code, 'E_INVALID_ARGS');
+  }
+});
+
 test('browser_get_html truncates oversized HTML and spills the full output to a temp file', async () => {
   const tools = createReadOnlyBrowserToolMap(createBrokerHarness(async (type) => {
     assert.equal(type, 'browser_get_html');
@@ -51,7 +62,7 @@ test('browser_get_html truncates oversized HTML and spills the full output to a 
     };
   }));
 
-  const result = await tools.get('browser_get_html')!.execute('call-1', { selector: '#app' });
+  const result = await tools.get('browser_get_html')!.execute('call-1', { tab_id: 7, selector: '#app' });
   assert.equal(result.details.ok, true);
   assert.equal(result.details.truncated, true);
   assert.match(textOf(result), /Full output:/);
@@ -82,7 +93,7 @@ test('browser_get_screenshot returns screenshots as image content and never expo
     };
   }));
 
-  const result = await tools.get('browser_get_screenshot')!.execute('call-1', {});
+  const result = await tools.get('browser_get_screenshot')!.execute('call-1', { tab_id: 7 });
   assert.equal(result.details.ok, true);
   assert.equal(result.details.imageAttached, true);
   assert.equal(result.details.spilledToFile, true);
@@ -103,7 +114,7 @@ test('browser_wait_for gives the bridge enough time to finish the requested wait
   const tools = createReadOnlyBrowserToolMap(createBrokerHarness(async (type, params, options) => {
     assert.equal(type, 'browser_wait_for');
     seenTimeout = options?.timeoutMs;
-    assert.deepEqual(params, { selector: '#ready', timeout_ms: 40_000 });
+    assert.deepEqual(params, { tab_id: 7, selector: '#ready', timeout_ms: 40_000 });
     return {
       ok: true,
       id: 'req-3',
@@ -116,7 +127,7 @@ test('browser_wait_for gives the bridge enough time to finish the requested wait
     };
   }));
 
-  const result = await tools.get('browser_wait_for')!.execute('call-1', { selector: '#ready', timeout_ms: 40_000 });
+  const result = await tools.get('browser_wait_for')!.execute('call-1', { tab_id: 7, selector: '#ready', timeout_ms: 40_000 });
   assert.equal(result.details.ok, true);
   assert.equal(seenTimeout, 41_500);
   assert.match(textOf(result), /matched/);
@@ -132,7 +143,7 @@ test('bridge transport failures become structured tool results', async () => {
     },
   } as any);
 
-  const result = await tools.get('browser_get_performance_metrics')!.execute('call-1', {});
+  const result = await tools.get('browser_get_performance_metrics')!.execute('call-1', { tab_id: 7 });
   assert.equal(result.details.ok, false);
   assert.equal((result.details.error as any).code, 'E_TIMEOUT');
   assert.match(textOf(result), /failed: boom/);
@@ -148,7 +159,7 @@ test('plain broker timeout errors are surfaced as E_TIMEOUT instead of bridge di
     },
   } as any);
 
-  const result = await tools.get('browser_get_html')!.execute('call-1', {});
+  const result = await tools.get('browser_get_html')!.execute('call-1', { tab_id: 7 });
   assert.equal(result.details.ok, false);
   assert.equal((result.details.error as any).code, 'E_TIMEOUT');
 });
@@ -163,7 +174,7 @@ test('browser_get_html rejects malformed success payloads without html/content',
     data: { url: 'https://example.com' },
   })));
 
-  const result = await tools.get('browser_get_html')!.execute('call-1', {});
+  const result = await tools.get('browser_get_html')!.execute('call-1', { tab_id: 7 });
   assert.equal(result.details.ok, false);
   assert.equal((result.details.error as any).code, 'E_PROTOCOL');
   assert.match(textOf(result), /did not include html/i);
@@ -181,7 +192,7 @@ test('browser_get_screenshot rejects malformed success payloads without image da
     },
   })));
 
-  const result = await tools.get('browser_get_screenshot')!.execute('call-1', {});
+  const result = await tools.get('browser_get_screenshot')!.execute('call-1', { tab_id: 7 });
   assert.equal(result.details.ok, false);
   assert.equal((result.details.error as any).code, 'E_INTERNAL');
   assert.match(textOf(result), /did not include image data/);
@@ -201,7 +212,7 @@ test('browser_get_performance_metrics uses a longer timeout when web vitals are 
     };
   }));
 
-  const result = await tools.get('browser_get_performance_metrics')!.execute('call-1', { include: ['web_vitals'] });
+  const result = await tools.get('browser_get_performance_metrics')!.execute('call-1', { tab_id: 7, include: ['web_vitals'] });
   assert.equal(result.details.ok, true);
   assert.equal(seenTimeout, 27_500);
 });

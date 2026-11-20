@@ -74,7 +74,7 @@ test('tool family builders expose all expected JS/navigation/destructive tools',
   assert.equal((browserClearSiteDataDefinition.parameters as any).properties.types.minItems, 1);
 });
 
-test('browser_evaluate_js forwards timeout-aware requests, defaults to the active tab, and truncates large payloads', async () => {
+test('browser_evaluate_js forwards timeout-aware requests, uses the explicit tab, and truncates large payloads', async () => {
   let captured: { type: string; params: any; timeoutMs?: number } | null = null;
   const broker = createBrokerStub(async (type, params, options) => {
     captured = { type, params, timeoutMs: options.timeoutMs };
@@ -88,13 +88,13 @@ test('browser_evaluate_js forwards timeout-aware requests, defaults to the activ
   });
 
   const tool = createBrowserEvaluateJsTool(broker);
-  const result = await tool.execute('call-1', { expression: 'document.title', timeout_ms: 1234 });
+  const result = await tool.execute('call-1', { tab_id: 7, expression: 'document.title', timeout_ms: 1234 });
 
   const recorded = captured as any;
   assert.ok(recorded);
   assert.equal(recorded.type, 'browser_evaluate_js');
   assert.equal(recorded.params.expression, 'document.title');
-  assert.equal(recorded.params.use_active_tab, true);
+  assert.equal(recorded.params.tab_id, 7);
   assert.equal(recorded.timeoutMs, 2234);
   assert.equal(result.details.ok, true);
   assert.equal(result.details.truncated, true);
@@ -107,8 +107,8 @@ test('script transport defaults allow 120 seconds for AI translation plus bridge
     budgets.push(options.timeoutMs ?? 0);
     return { v: 1, kind: 'response', id: 'script-budget', ok: true, data: { tabId: 7, value: 1 } };
   });
-  await createBrowserEvaluateJsTool(broker).execute('evaluate-budget', { expression: '1' });
-  await createBrowserRunJsTool(broker).execute('program-budget', { code: 'return 1;' });
+  await createBrowserEvaluateJsTool(broker).execute('evaluate-budget', { tab_id: 7, expression: '1' });
+  await createBrowserRunJsTool(broker).execute('program-budget', { tab_id: 7, code: 'return 1;' });
   assert.deepEqual(budgets, [121_000, 121_000]);
 });
 
@@ -122,7 +122,7 @@ test('browser_run_js returns structured bridge failures instead of throwing', as
   }));
 
   const tool = createBrowserRunJsTool(broker);
-  const result = await tool.execute('call-2', { code: 'return 1;' });
+  const result = await tool.execute('call-2', { tab_id: 7, code: 'return 1;' });
 
   assert.equal(result.details.ok, false);
   assert.equal((result.details as any).error.code, 'E_TIMEOUT');
@@ -153,7 +153,7 @@ test('browser_create_tab returns a tab id without defaulting to the active tab',
   assert.match(textOf(result), /Created tab 15/);
 });
 
-test('navigation/destructive tool builders pass through successful bridge responses and default relevant tools to the active tab', async () => {
+test('navigation/destructive tool builders pass through successful bridge responses and use explicit tabs', async () => {
   const calls: Array<{ type: string; params: any }> = [];
   const broker = createBrokerStub(async (type, params) => {
     calls.push({ type, params });
@@ -166,10 +166,10 @@ test('navigation/destructive tool builders pass through successful bridge respon
     };
   });
 
-  const navigate = await createBrowserNavigateTool(broker).execute('call-3', { url: 'https://example.com' });
+  const navigate = await createBrowserNavigateTool(broker).execute('call-3', { tab_id: 9, url: 'https://example.com' });
   assert.equal(navigate.details.ok, true);
   assert.match(textOf(navigate), /Navigated tab 9/);
-  assert.equal(calls[0]?.params?.use_active_tab, true);
+  assert.equal(calls[0]?.params?.tab_id, 9);
 
   const switchTab = await createBrowserSwitchTabTool(broker).execute('call-4', { tab_id: 9 });
   assert.match(textOf(switchTab), /Switched to tab 9/);
@@ -180,7 +180,7 @@ test('navigation/destructive tool builders pass through successful bridge respon
   const reload = await createBrowserReloadTool(broker).execute('call-6', { tab_id: 9 });
   assert.match(textOf(reload), /Reloaded tab 9/);
 
-  const clear = await createBrowserClearSiteDataTool(broker).execute('call-7', { origin: 'https://example.com' });
+  const clear = await createBrowserClearSiteDataTool(broker).execute('call-7', { tab_id: 9, origin: 'https://example.com' });
   assert.match(textOf(clear), /Cleared site data/);
   // Explicit origin/url must NOT be combined with use_active_tab: that would
   // send conflicting selectors to the bridge.
@@ -188,7 +188,7 @@ test('navigation/destructive tool builders pass through successful bridge respon
   assert.equal(calls.at(-1)?.params?.origin, 'https://example.com');
 });
 
-test('browser_clear_site_data defaults to the active tab only when no explicit target is given', async () => {
+test('browser_clear_site_data rejects a missing tab even with an explicit URL', async () => {
   const calls: Array<{ type: string; params: any }> = [];
   const broker = createBrokerStub(async (type, params) => {
     calls.push({ type, params });
@@ -201,10 +201,11 @@ test('browser_clear_site_data defaults to the active tab only when no explicit t
     };
   });
 
-  await createBrowserClearSiteDataTool(broker).execute('call-c1', {});
-  assert.equal(calls.at(-1)?.params?.use_active_tab, true);
+  const rejected = await createBrowserClearSiteDataTool(broker).execute('call-c1', { url: 'https://example.com/path' });
+  assert.equal(rejected.details.ok, false);
+  assert.equal(calls.length, 0);
 
-  await createBrowserClearSiteDataTool(broker).execute('call-c2', { url: 'https://example.com/path' });
+  await createBrowserClearSiteDataTool(broker).execute('call-c2', { tab_id: 9, url: 'https://example.com/path' });
   assert.equal(calls.at(-1)?.params?.use_active_tab, undefined);
   assert.equal(calls.at(-1)?.params?.url, 'https://example.com/path');
 });
@@ -240,7 +241,7 @@ test('navigation tools reject malformed success payloads without required fields
   const navBroker = createBrokerStub(async () => ({
     v: 1, kind: 'response', id: 'n', ok: true, data: { url: 'https://example.com' },
   }));
-  const navResult = await createBrowserNavigateTool(navBroker).execute('call-n', { url: 'https://example.com' });
+  const navResult = await createBrowserNavigateTool(navBroker).execute('call-n', { tab_id: 9, url: 'https://example.com' });
   assert.equal(navResult.details.ok, false);
   assert.equal((navResult.details as any).error.code, 'E_PROTOCOL');
   assert.match(textOf(navResult), /browser_navigate failed/);
@@ -249,7 +250,7 @@ test('navigation tools reject malformed success payloads without required fields
   const clearBroker = createBrokerStub(async () => ({
     v: 1, kind: 'response', id: 'c', ok: true, data: { cleared: true },
   }));
-  const clearResult = await createBrowserClearSiteDataTool(clearBroker).execute('call-c', { origin: 'https://example.com' });
+  const clearResult = await createBrowserClearSiteDataTool(clearBroker).execute('call-c', { tab_id: 9, origin: 'https://example.com' });
   assert.equal(clearResult.details.ok, false);
   assert.equal((clearResult.details as any).error.code, 'E_PROTOCOL');
 });

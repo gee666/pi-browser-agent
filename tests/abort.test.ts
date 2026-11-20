@@ -178,7 +178,7 @@ test('browser_evaluate_js reports cancellation instead of a browser failure', as
 
   const tool = createBrowserEvaluateJsTool(broker);
   const controller = new AbortController();
-  const pending = tool.execute('call-1', { expression: 'document.title' }, controller.signal);
+  const pending = tool.execute('call-1', { tab_id: 7, expression: 'document.title' }, controller.signal);
   setTimeout(() => controller.abort(), 20);
 
   const result: any = await pending;
@@ -220,7 +220,7 @@ test('read-only tools forward the abort signal and label cancellation', async ()
   assert.ok(htmlTool);
 
   const controller = new AbortController();
-  const pending = htmlTool.execute('call-2', { url: 'https://example.com' }, controller.signal);
+  const pending = htmlTool.execute('call-2', { tab_id: 7 }, controller.signal);
   setTimeout(() => controller.abort(), 20);
 
   const result: any = await pending;
