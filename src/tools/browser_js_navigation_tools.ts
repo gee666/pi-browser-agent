@@ -264,7 +264,7 @@ export const browserEvaluateJsDefinition = {
 
 export const browserRunJsDefinition = {
   name: 'browser_run_js',
-  description: 'Translate a JavaScript program with the configured browser AI model, then execute its validated native-input/read plan. All input uses the backend selected in extension settings, either CDP or Python; off-screen targets are scrolled into view first. Supports a bounded set of actions and reads, not arbitrary page JavaScript. Unsupported code fails without direct JavaScript execution.',
+  description: 'Translate a JavaScript program with the configured browser AI model, then execute its validated native-input/read plan. All input uses the backend selected in extension settings, either CDP or Python; off-screen targets are scrolled into view first. Supports a bounded set of actions and reads, not arbitrary page JavaScript. Use `return` to get a value (e.g. `return document.title;`). Unsupported code fails without direct JavaScript execution.',
   promptSnippet: 'Translate JavaScript into validated native input and page reads.',
   parameters: Type.Object({
     tab_id: tabIdSchema(),
@@ -382,6 +382,7 @@ export const browserClearSiteDataDefinition = {
   }),
 } as const;
 
+// Legacy programmatic entry point; not advertised or registered as a Pi tool.
 export const createBrowserEvaluateJsTool = createRequestTool({
   ...browserEvaluateJsDefinition,
   timeoutFromParams: (params) => Number(params.timeout_ms ?? 120_000) + 1_000,
@@ -489,7 +490,6 @@ export function createBrowserReloadExtensionTool(broker: BrowserAgentBroker) {
 
 export function createBrowserJsNavigationToolFamily(broker: BrowserAgentBroker) {
   return [
-    createBrowserEvaluateJsTool(broker),
     createBrowserRunJsTool(broker),
     createBrowserCreateTabTool(broker),
     createBrowserNavigateTool(broker),

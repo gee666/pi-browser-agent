@@ -58,7 +58,6 @@ test('tool family builders expose all expected JS/navigation/destructive tools',
   const broker = createBrokerStub(async () => ({ v: 1, kind: 'response', id: 'unused', ok: true, data: {} }));
   const family = createBrowserJsNavigationToolFamily(broker).map((tool) => tool.name);
   assert.deepEqual(family, [
-    'browser_evaluate_js',
     'browser_run_js',
     'browser_create_tab',
     'browser_navigate',
@@ -74,7 +73,7 @@ test('tool family builders expose all expected JS/navigation/destructive tools',
   assert.equal((browserClearSiteDataDefinition.parameters as any).properties.types.minItems, 1);
 });
 
-test('browser_evaluate_js forwards timeout-aware requests, uses the explicit tab, and truncates large payloads', async () => {
+test('legacy browser_evaluate_js forwards timeout-aware requests, uses the explicit tab, and truncates large payloads', async () => {
   let captured: { type: string; params: any; timeoutMs?: number } | null = null;
   const broker = createBrokerStub(async (type, params, options) => {
     captured = { type, params, timeoutMs: options.timeoutMs };

@@ -24,7 +24,6 @@ const PLACEHOLDER_TOOL_SPECS = [
   ['browser_get_network', 'Inspect network requests from the browser.'],
   ['browser_get_accessibility_tree', 'Read the accessibility tree.'],
   ['browser_get_performance_metrics', 'Read performance metrics.'],
-  ['browser_evaluate_js', 'AI-translate a JavaScript expression into validated native input and page reads.'],
   ['browser_run_js', 'AI-translate JavaScript into validated native input and page reads.'],
   ['browser_create_tab', 'Create a new browser tab.'],
   ['browser_list_tabs', 'List browser tabs.'],

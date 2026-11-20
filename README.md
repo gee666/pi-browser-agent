@@ -62,7 +62,6 @@ The full toolkit registered for the session is:
 - `browser_get_network`
 - `browser_get_accessibility_tree`
 - `browser_get_performance_metrics`
-- `browser_evaluate_js`
 - `browser_run_js`
 - `browser_create_tab`
 - `browser_list_tabs`
@@ -80,7 +79,7 @@ Create a background tab with `browser_create_tab` and pass its returned ID as `t
 
 ## JavaScript input safety
 
-`browser_evaluate_js` and `browser_run_js` send every supplied script to the Chrome extension's configured AI provider. The extension translates source into a validated plan rather than executing it in the page. Clicks, focus, typing, keys, shortcuts and scrolling use the input backend selected in extension settings, either CDP or Python. It scrolls off-screen targets into view before interacting, then reads their coordinates again. CDP works without the Python service installed. Only the Python backend needs that service and can affect the foreground desktop.
+`browser_run_js` sends every supplied script to the Chrome extension's configured AI provider. To read a value, pass code such as `return document.title;`. The legacy `browser_evaluate_js` bridge request still works for existing programmatic callers but is not registered as a Pi tool. The extension translates source into a validated plan rather than executing it in the page. Clicks, focus, typing, keys, shortcuts and scrolling use the input backend selected in extension settings, either CDP or Python. It scrolls off-screen targets into view before interacting, then reads their coordinates again. CDP works without the Python service installed. Only the Python backend needs that service and can affect the foreground desktop.
 
 This is a bounded JavaScript translation interface, not an arbitrary JavaScript runtime. Supported actions and fixed DOM reads preserve the plan's result. Unsupported code, invalid model responses, missing provider configuration, cancellation and native-input failures return errors. They never fall back to `element.click()`, synthetic events or direct DOM input. Requesting remote object handles or disabling promise awaiting is unsupported. Console capture is limited to entries represented by the translated plan.
 

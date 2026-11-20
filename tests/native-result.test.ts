@@ -55,7 +55,9 @@ test('every registered browser implementation declares native output and preserv
   const broker = new BrowserAgentBroker({ port: 0, taskStore: new TaskStore({ dir }) });
   try {
     registerAllTools({ registerTool(tool) { tools.push(tool); } }, { broker });
-    assert.equal(tools.length, 22);
+    assert.equal(tools.length, 21);
+    assert.ok(tools.some((tool) => tool.name === 'browser_run_js'));
+    assert.ok(!tools.some((tool) => tool.name === 'browser_evaluate_js'));
     assert.ok(tools.every((tool) => tool.outputSchema), 'no family may miss the registration adapter');
     for (const name of ['browser_list_tabs', 'browser_get_html', 'browser_get_console_logs', 'browser_run_task']) {
       const tool = tools.find((item) => item.name === name);

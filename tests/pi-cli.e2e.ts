@@ -14,7 +14,7 @@ const piBin = process.env.EVERGREEN_PI_BIN || 'pi';
 const names = ['activate_browser_agent_tools', 'browser_run_task', 'browser_get_task_history',
   'browser_list_tasks', 'browser_get_screenshot', 'browser_get_html', 'browser_get_dom_info',
   'browser_get_computed_styles', 'browser_get_console_logs', 'browser_get_network',
-  'browser_get_accessibility_tree', 'browser_get_performance_metrics', 'browser_evaluate_js',
+  'browser_get_accessibility_tree', 'browser_get_performance_metrics',
   'browser_run_js', 'browser_create_tab', 'browser_list_tabs', 'browser_switch_tab',
   'browser_close_tab', 'browser_navigate', 'browser_reload', 'browser_reload_extension',
   'browser_wait_for', 'browser_clear_site_data'].sort();
