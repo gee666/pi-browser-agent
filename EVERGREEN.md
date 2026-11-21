@@ -53,7 +53,10 @@ bridge task execution, result/error persistence, cross-process history and clean
 A live EVERGREEN_E2E_MODEL call must discover and execute browser_list_tasks even
 without Chrome. Settings/state are isolated; provider credentials are reused.
 These tests protect available tools, working forwarding and durable inspection,
-not merely individual helper outputs. Tested against latest Pi 1.5.0.
+not merely individual helper outputs. Tested against Pi 1.6.0.
+Pi 1.6.0's non-strict OpenAI fallback supports the unconstrained JSON values in
+browser_run_js.args; keep them unconstrained. Session startup/reload uses the
+existing teardown and reacquisition path. No custom renderers consume cached TUI arrays.
 
 ## Relevant changelog topics
 Watch extension lifecycle/reload, tool registration and execution signatures,
